@@ -2,18 +2,13 @@ name: Build Android APK
 
 on:
   push:
-    branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
   workflow_dispatch:
 
 jobs:
-  build-apk:
-    name: Assemble Debug APK (MediaSave)
+  build:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Repository
+      - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set up JDK 21
@@ -25,58 +20,29 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
 
-      - name: Accept Android SDK Licenses & Install SDK 36.1
+      - name: Accept Android SDK Licenses
         run: |
           yes | sdkmanager --licenses || true
-          sdkmanager "platforms;android-36.1" "build-tools;36.0.0" || sdkmanager "platforms;android-36" "build-tools;35.0.0" || true
 
-      - name: Setup Gradle
+      - name: Setup Gradle 9.3.1
         uses: gradle/actions/setup-gradle@v4
         with:
-          gradle-version: '9.1.0'
+          gradle-version: '9.3.1'
 
-      - name: Prepare Environment & Debug Keystore
+      - name: Prepare Keystore & Env
         run: |
-          if [ ! -f .env ]; then
-            if [ -f .env.example ]; then
-              cp .env.example .env
-            else
-              touch .env
-            fi
-          fi
-          if [ ! -f debug.keystore ]; then
-            if [ -f debug.keystore.base64 ]; then
-              base64 -d debug.keystore.base64 > debug.keystore
-            else
-              keytool -genkeypair -v \
-                -keystore debug.keystore \
-                -storepass android \
-                -alias androiddebugkey \
-                -keypass android \
-                -keyalg RSA \
-                -keysize 2048 \
-                -validity 10000 \
-                -dname "CN=Android Debug,O=Android,C=US"
-            fi
+          cp -n .env.example .env || touch .env
+          if [ -f debug.keystore.base64 ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
+          elif [ ! -f debug.keystore ]; then
+            keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
           fi
 
-      - name: Run Gradle assembleDebug
-        run: |
-          if [ -f "./gradlew" ]; then
-            chmod +x ./gradlew
-            ./gradlew assembleDebug --no-daemon --stacktrace
-          else
-            gradle assembleDebug --no-daemon --stacktrace
-          fi
+      - name: Build Debug APK
+        run: gradle assembleDebug --no-daemon --stacktrace
 
-      - name: Verify Generated APK
-        run: |
-          ls -lh app/build/outputs/apk/debug/app-debug.apk
-
-      - name: Upload Downloadable APK Artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: MediaSave-app-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
-          retention-days: 30
