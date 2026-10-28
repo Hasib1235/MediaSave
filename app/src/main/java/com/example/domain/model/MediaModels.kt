@@ -28,27 +28,27 @@ enum class MediaPlatform(
     ),
     YOUTUBE(
         displayName = "YouTube",
-        badgeLabel = "YOUTUBE API",
-        supportsDirectDownload = false,
-        complianceSummary = "Uses official YouTube oEmbed API for public metadata. Direct stream scraping is restricted by YouTube Terms of Service (Section 5.B)."
+        badgeLabel = "YOUTUBE",
+        supportsDirectDownload = true,
+        complianceSummary = "Extracts multi-resolution MP4/WebM video and M4A/Opus audio streams from YouTube videos and Shorts."
     ),
     FACEBOOK(
         displayName = "Facebook",
-        badgeLabel = "META GRAPH",
-        supportsDirectDownload = false,
-        complianceSummary = "Respects Meta Platform Terms and access controls. Only user-owned exported media or direct CDN links are downloadable."
+        badgeLabel = "FACEBOOK",
+        supportsDirectDownload = true,
+        complianceSummary = "Extracts HD and SD MP4 video and audio streams from public Facebook Watch, Reels, and video posts."
     ),
     INSTAGRAM(
         displayName = "Instagram",
-        badgeLabel = "IG GRAPH",
-        supportsDirectDownload = false,
-        complianceSummary = "Respects Instagram Graph API permissions and copyright controls. Private or scraped media extraction is prohibited."
+        badgeLabel = "INSTAGRAM",
+        supportsDirectDownload = true,
+        complianceSummary = "Extracts HD MP4 video and audio streams from public Instagram Reels and video posts."
     ),
     TIKTOK(
         displayName = "TikTok",
-        badgeLabel = "TIKTOK OEMBED",
-        supportsDirectDownload = false,
-        complianceSummary = "Uses official TikTok oEmbed for metadata inspection. Direct video downloads require creator export or authorized direct links."
+        badgeLabel = "TIKTOK",
+        supportsDirectDownload = true,
+        complianceSummary = "Extracts No-Watermark HD MP4 video and original audio streams from TikTok links."
     ),
     UNSUPPORTED(
         displayName = "Unsupported Source",

@@ -111,22 +111,83 @@ class ExampleRobolectricTest {
         assertTrue(wavMeta.audioStreams.isNotEmpty())
         assertEquals(AudioFormat.WAV, wavMeta.audioStreams.first().sourceFormat)
 
-        // 3. Restricted social URLs (YouTube, Facebook, Instagram, TikTok) must return PlatformRestricted rather than faking downloads
-        val ytState = registry.validateAndAnalyze("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
-        assertTrue(ytState is MediaAnalysisState.PlatformRestricted)
-        assertEquals(MediaPlatform.YOUTUBE, (ytState as MediaAnalysisState.PlatformRestricted).platform)
+        // 3. Social URLs (YouTube, Facebook, Instagram, TikTok) extract downloadable video & audio streams
+        val socialTestClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                val reqUrl = req.url.toString()
+                val bodyJson = when {
+                    reqUrl.contains("youtubei/v1/player") -> """
+                        {
+                          "playabilityStatus": {"status": "OK"},
+                          "videoDetails": {"title": "Test YouTube Clip", "author": "YT Channel", "lengthSeconds": "30"},
+                          "streamingData": {
+                            "formats": [
+                              {"itag": 22, "url": "https://cdn.example.org/yt_720p.mp4", "mimeType": "video/mp4", "width": 1280, "height": 720, "bitrate": 1500000, "fps": 30}
+                            ],
+                            "adaptiveFormats": [
+                              {"itag": 140, "url": "https://cdn.example.org/yt_audio.m4a", "mimeType": "audio/mp4", "bitrate": 128000, "audioSampleRate": "44100", "audioChannels": 2}
+                            ]
+                          }
+                        }
+                    """.trimIndent()
+                    reqUrl.contains("tikwm.com/api") -> """
+                        {
+                          "code": 0,
+                          "data": {
+                            "id": "734567890",
+                            "title": "TikTok Dance Clip",
+                            "duration": 15,
+                            "hdplay": "https://cdn.example.org/tiktok_1080p.mp4",
+                            "play": "https://cdn.example.org/tiktok_720p.mp4",
+                            "music": "https://cdn.example.org/tiktok_audio.mp3",
+                            "author": {"nickname": "Creator"}
+                          }
+                        }
+                    """.trimIndent()
+                    reqUrl.contains("facebook.com") -> """
+                        <html><head><title>FB Watch Clip</title></head><body>
+                        {"browser_native_hd_url":"https:\/\/cdn.example.org\/fb_1080p.mp4","browser_native_sd_url":"https:\/\/cdn.example.org\/fb_480p.mp4"}
+                        </body></html>
+                    """.trimIndent()
+                    reqUrl.contains("instagram.com") -> """
+                        <html><body>{"video_url":"https:\/\/cdn.example.org\/ig_reel_1080p.mp4","username":"igcreator"}</body></html>
+                    """.trimIndent()
+                    else -> "{}"
+                }
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .header("Content-Type", if (reqUrl.contains("facebook.com") || reqUrl.contains("instagram.com")) "text/html" else "application/json")
+                    .body(bodyJson.toResponseBody("text/plain".toMediaType()))
+                    .build()
+            }
+            .build()
 
-        val fbState = registry.validateAndAnalyze("https://www.facebook.com/watch/?v=123456789")
-        assertTrue(fbState is MediaAnalysisState.PlatformRestricted)
-        assertEquals(MediaPlatform.FACEBOOK, (fbState as MediaAnalysisState.PlatformRestricted).platform)
+        val socialRegistry = PlatformAdapterRegistry(socialTestClient)
 
-        val igState = registry.validateAndAnalyze("https://www.instagram.com/reel/C8xYz123AbC/")
-        assertTrue(igState is MediaAnalysisState.PlatformRestricted)
-        assertEquals(MediaPlatform.INSTAGRAM, (igState as MediaAnalysisState.PlatformRestricted).platform)
+        val ytState = socialRegistry.validateAndAnalyze("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        assertTrue(ytState is MediaAnalysisState.Success)
+        assertEquals(MediaPlatform.YOUTUBE, (ytState as MediaAnalysisState.Success).metadata.platform)
+        assertTrue(ytState.metadata.videoStreams.isNotEmpty())
 
-        val ttState = registry.validateAndAnalyze("https://www.tiktok.com/@creator/video/734567890")
-        assertTrue(ttState is MediaAnalysisState.PlatformRestricted)
-        assertEquals(MediaPlatform.TIKTOK, (ttState as MediaAnalysisState.PlatformRestricted).platform)
+        val fbState = socialRegistry.validateAndAnalyze("https://www.facebook.com/watch/?v=123456789")
+        assertTrue(fbState is MediaAnalysisState.Success)
+        assertEquals(MediaPlatform.FACEBOOK, (fbState as MediaAnalysisState.Success).metadata.platform)
+        assertTrue(fbState.metadata.videoStreams.isNotEmpty())
+
+        val igState = socialRegistry.validateAndAnalyze("https://www.instagram.com/reel/C8xYz123AbC/")
+        assertTrue(igState is MediaAnalysisState.Success)
+        assertEquals(MediaPlatform.INSTAGRAM, (igState as MediaAnalysisState.Success).metadata.platform)
+        assertTrue(igState.metadata.videoStreams.isNotEmpty())
+
+        val ttState = socialRegistry.validateAndAnalyze("https://vt.tiktok.com/ZSgs61xSd/")
+        assertTrue(ttState is MediaAnalysisState.Success)
+        assertEquals(MediaPlatform.TIKTOK, (ttState as MediaAnalysisState.Success).metadata.platform)
+        assertTrue(ttState.metadata.videoStreams.isNotEmpty())
+        assertTrue(ttState.metadata.audioStreams.isNotEmpty())
     }
 
     @Test

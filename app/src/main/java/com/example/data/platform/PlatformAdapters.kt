@@ -520,7 +520,7 @@ class DirectUrlMediaAdapter(
 }
 
 /**
- * Adapter 3: YouTube Official oEmbed & Compliance Adapter
+ * Adapter 3: YouTube Stream Extractor (InnerTube Player API + Piped/Invidious Fallback)
  */
 class YouTubePlatformAdapter(
     private val httpClient: OkHttpClient
@@ -528,75 +528,165 @@ class YouTubePlatformAdapter(
     override val platform: MediaPlatform = MediaPlatform.YOUTUBE
 
     override suspend fun analyze(url: String): MediaAnalysisState = withContext(Dispatchers.IO) {
-        var title: String? = null
-        var author: String? = null
-        var thumbnailUrl: String? = null
+        val videoId = SocialStreamExtractor.extractYouTubeVideoId(url)
+            ?: return@withContext MediaAnalysisState.Error(
+                url = url,
+                errorTitle = "Invalid YouTube Link",
+                userMessage = "Could not find a valid YouTube video or Shorts ID in the provided link."
+            )
 
-        try {
-            val encoded = URLEncoder.encode(url, "UTF-8")
+        var title = "YouTube Video ($videoId)"
+        var author = "YouTube Creator"
+        var thumbnailUrl: String? = "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
+        var durationMs = 0L
+
+        // Fetch public title/author via oEmbed first for fast metadata
+        runCatching {
+            val encoded = URLEncoder.encode("https://www.youtube.com/watch?v=$videoId", "UTF-8")
             val oembedUrl = "https://www.youtube.com/oembed?url=$encoded&format=json"
             val req = Request.Builder().url(oembedUrl).get().build()
             httpClient.newCall(req).execute().use { resp ->
                 if (resp.isSuccessful) {
                     val json = JSONObject(resp.body?.string().orEmpty())
-                    title = json.optString("title").takeIf { it.isNotBlank() }
-                    author = json.optString("author_name").takeIf { it.isNotBlank() }
-                    thumbnailUrl = json.optString("thumbnail_url").takeIf { it.isNotBlank() }
+                    title = json.optString("title").takeIf { it.isNotBlank() } ?: title
+                    author = json.optString("author_name").takeIf { it.isNotBlank() } ?: author
+                    thumbnailUrl = json.optString("thumbnail_url").takeIf { it.isNotBlank() } ?: thumbnailUrl
                 }
             }
-        } catch (_: Exception) {
         }
 
-        MediaAnalysisState.PlatformRestricted(
-            platform = MediaPlatform.YOUTUBE,
-            url = url,
-            publicTitle = title,
-            publicAuthor = author,
-            thumbnailUrl = thumbnailUrl,
-            restrictionReason = "YouTube Terms of Service (Section 5.B) and Google Play Developer Policies prohibit unauthorized stream scraping or bypassing YouTube access controls. Official YouTube Data API v3 and oEmbed endpoints provide metadata only, not raw downloadable video/audio streams.",
-            permittedAlternative = "To download your own YouTube content lawfully, export via Google Takeout / YouTube Studio, or use an authorized direct media URL."
+        val videoStreams = mutableListOf<VideoStreamOption>()
+        val audioStreams = mutableListOf<AudioStreamOption>()
+
+        // Layer 1: YouTube InnerTube Player API (ANDROID_VR, IOS, ANDROID_TESTSUITE)
+        val innerTubeExtracted = SocialStreamExtractor.extractYouTubeViaInnerTube(
+            httpClient = httpClient,
+            videoId = videoId
+        )
+        if (innerTubeExtracted != null) {
+            if (innerTubeExtracted.title.isNotBlank()) title = innerTubeExtracted.title
+            if (innerTubeExtracted.author.isNotBlank()) author = innerTubeExtracted.author
+            if (innerTubeExtracted.durationMs > 0L) durationMs = innerTubeExtracted.durationMs
+            if (!innerTubeExtracted.thumbnailUrl.isNullOrBlank()) thumbnailUrl = innerTubeExtracted.thumbnailUrl
+            videoStreams.addAll(innerTubeExtracted.videoStreams)
+            audioStreams.addAll(innerTubeExtracted.audioStreams)
+        }
+
+        // Layer 2: Public Piped / Invidious API Fallback if InnerTube streams were empty
+        if (videoStreams.isEmpty() && audioStreams.isEmpty()) {
+            val pipedExtracted = SocialStreamExtractor.extractYouTubeViaPipedOrInvidious(
+                httpClient = httpClient,
+                videoId = videoId
+            )
+            if (pipedExtracted != null) {
+                if (pipedExtracted.title.isNotBlank()) title = pipedExtracted.title
+                if (pipedExtracted.author.isNotBlank()) author = pipedExtracted.author
+                if (pipedExtracted.durationMs > 0L) durationMs = pipedExtracted.durationMs
+                if (!pipedExtracted.thumbnailUrl.isNullOrBlank()) thumbnailUrl = pipedExtracted.thumbnailUrl
+                videoStreams.addAll(pipedExtracted.videoStreams)
+                audioStreams.addAll(pipedExtracted.audioStreams)
+            }
+        }
+
+        if (videoStreams.isEmpty() && audioStreams.isEmpty()) {
+            return@withContext MediaAnalysisState.Error(
+                url = url,
+                errorTitle = "Unable to Extract YouTube Stream",
+                userMessage = "Could not extract direct media streams for this YouTube video. Verify the video is public, not age-restricted or live-only, and check your internet connection."
+            )
+        }
+
+        MediaAnalysisState.Success(
+            AnalyzedMediaMetadata(
+                sourceUrl = url,
+                title = title,
+                authorOrDomain = author,
+                platform = MediaPlatform.YOUTUBE,
+                durationMs = durationMs,
+                thumbnailUrl = thumbnailUrl,
+                supportsRangeRequests = true,
+                videoStreams = videoStreams.distinctBy { "${it.resolutionHeight}_${it.container}_${it.streamType}" }
+                    .sortedBy { it.resolutionHeight },
+                audioStreams = audioStreams.distinctBy { "${it.sourceFormat}_${it.bitrateKbps}" }
+                    .sortedByDescending { it.bitrateKbps },
+                inspectionMethod = "YouTube Stream Extractor (Multi-Resolution MP4/WebM & Audio)"
+            )
         )
     }
 }
 
 /**
- * Adapter 4: Facebook Official Compliance Adapter
+ * Adapter 4: Facebook Watch / Reels / Video Post Stream Extractor
  */
-class FacebookPlatformAdapter : PlatformMediaAdapter {
+class FacebookPlatformAdapter(
+    private val httpClient: OkHttpClient
+) : PlatformMediaAdapter {
     override val platform: MediaPlatform = MediaPlatform.FACEBOOK
 
-    override suspend fun analyze(url: String): MediaAnalysisState =
-        MediaAnalysisState.PlatformRestricted(
-            platform = MediaPlatform.FACEBOOK,
-            url = url,
-            publicTitle = "Facebook Watch / Video Post",
-            publicAuthor = "Meta Platform Content",
-            thumbnailUrl = null,
-            restrictionReason = "Meta Platform Terms and Graph API access controls prohibit third-party scraping of Facebook video streams without an authenticated Page/User OAuth token and content ownership.",
-            permittedAlternative = "Use Facebook's 'Download Your Information' archive tool for your own videos, or provide a direct authorized CDN media URL."
+    override suspend fun analyze(url: String): MediaAnalysisState = withContext(Dispatchers.IO) {
+        val extracted = SocialStreamExtractor.extractFacebookStreams(httpClient, url)
+        if (extracted == null || (extracted.videoStreams.isEmpty() && extracted.audioStreams.isEmpty())) {
+            return@withContext MediaAnalysisState.Error(
+                url = url,
+                errorTitle = "Unable to Extract Facebook Video",
+                userMessage = "Could not find a downloadable video stream at this Facebook link. Make sure the Facebook video or Reel is public (not friends-only or in a private group)."
+            )
+        }
+
+        MediaAnalysisState.Success(
+            AnalyzedMediaMetadata(
+                sourceUrl = url,
+                title = extracted.title.ifBlank { "Facebook Video" },
+                authorOrDomain = extracted.author.ifBlank { "Facebook Creator" },
+                platform = MediaPlatform.FACEBOOK,
+                durationMs = extracted.durationMs,
+                thumbnailUrl = extracted.thumbnailUrl,
+                supportsRangeRequests = true,
+                videoStreams = extracted.videoStreams.sortedBy { it.resolutionHeight },
+                audioStreams = extracted.audioStreams,
+                inspectionMethod = "Facebook HD/SD MP4 Stream Extractor"
+            )
         )
+    }
 }
 
 /**
- * Adapter 5: Instagram Official Compliance Adapter
+ * Adapter 5: Instagram Reels / Post / IGTV Stream Extractor
  */
-class InstagramPlatformAdapter : PlatformMediaAdapter {
+class InstagramPlatformAdapter(
+    private val httpClient: OkHttpClient
+) : PlatformMediaAdapter {
     override val platform: MediaPlatform = MediaPlatform.INSTAGRAM
 
-    override suspend fun analyze(url: String): MediaAnalysisState =
-        MediaAnalysisState.PlatformRestricted(
-            platform = MediaPlatform.INSTAGRAM,
-            url = url,
-            publicTitle = "Instagram Reel / Post",
-            publicAuthor = "Instagram Creator Content",
-            thumbnailUrl = null,
-            restrictionReason = "Instagram Graph API requires authenticated Business/Creator OAuth tokens and ownership of the media object. Unauthorized scraping of third-party Reels or private posts is restricted.",
-            permittedAlternative = "Save your own Reels via the Instagram app or provide an authorized direct HTTPS media link."
+    override suspend fun analyze(url: String): MediaAnalysisState = withContext(Dispatchers.IO) {
+        val extracted = SocialStreamExtractor.extractInstagramStreams(httpClient, url)
+        if (extracted == null || (extracted.videoStreams.isEmpty() && extracted.audioStreams.isEmpty())) {
+            return@withContext MediaAnalysisState.Error(
+                url = url,
+                errorTitle = "Unable to Extract Instagram Reel/Video",
+                userMessage = "Could not extract a direct video stream from this Instagram link. Make sure the Reel or post is from a public account."
+            )
+        }
+
+        MediaAnalysisState.Success(
+            AnalyzedMediaMetadata(
+                sourceUrl = url,
+                title = extracted.title.ifBlank { "Instagram Reel" },
+                authorOrDomain = extracted.author.ifBlank { "Instagram Creator" },
+                platform = MediaPlatform.INSTAGRAM,
+                durationMs = extracted.durationMs,
+                thumbnailUrl = extracted.thumbnailUrl,
+                supportsRangeRequests = true,
+                videoStreams = extracted.videoStreams.sortedBy { it.resolutionHeight },
+                audioStreams = extracted.audioStreams,
+                inspectionMethod = "Instagram Reel/Post Direct MP4 Stream Extractor"
+            )
         )
+    }
 }
 
 /**
- * Adapter 6: TikTok Official oEmbed & Compliance Adapter
+ * Adapter 6: TikTok No-Watermark HD Video & Original Audio Stream Extractor
  */
 class TikTokPlatformAdapter(
     private val httpClient: OkHttpClient
@@ -604,50 +694,46 @@ class TikTokPlatformAdapter(
     override val platform: MediaPlatform = MediaPlatform.TIKTOK
 
     override suspend fun analyze(url: String): MediaAnalysisState = withContext(Dispatchers.IO) {
-        var title: String? = null
-        var author: String? = null
-        var thumbnailUrl: String? = null
-
-        try {
-            val encoded = URLEncoder.encode(url, "UTF-8")
-            val oembedUrl = "https://www.tiktok.com/oembed?url=$encoded"
-            val req = Request.Builder().url(oembedUrl).get().build()
-            httpClient.newCall(req).execute().use { resp ->
-                if (resp.isSuccessful) {
-                    val json = JSONObject(resp.body?.string().orEmpty())
-                    title = json.optString("title").takeIf { it.isNotBlank() }
-                    author = json.optString("author_name").takeIf { it.isNotBlank() }
-                    thumbnailUrl = json.optString("thumbnail_url").takeIf { it.isNotBlank() }
-                }
-            }
-        } catch (_: Exception) {
+        val extracted = SocialStreamExtractor.extractTikTokStreams(httpClient, url)
+        if (extracted == null || (extracted.videoStreams.isEmpty() && extracted.audioStreams.isEmpty())) {
+            return@withContext MediaAnalysisState.Error(
+                url = url,
+                errorTitle = "Unable to Extract TikTok Video",
+                userMessage = "Could not resolve downloadable video/audio streams for this TikTok link. Please verify the TikTok link is public and check your internet connection."
+            )
         }
 
-        MediaAnalysisState.PlatformRestricted(
-            platform = MediaPlatform.TIKTOK,
-            url = url,
-            publicTitle = title,
-            publicAuthor = author,
-            thumbnailUrl = thumbnailUrl,
-            restrictionReason = "TikTok Display API and oEmbed endpoints provide public metadata and embed codes only; raw stream extraction without creator authorization is restricted by TikTok Developer Terms.",
-            permittedAlternative = "Use TikTok's built-in 'Save Video' feature when permitted by the creator, or paste an authorized direct media URL."
+        MediaAnalysisState.Success(
+            AnalyzedMediaMetadata(
+                sourceUrl = url,
+                title = extracted.title.ifBlank { "TikTok Video" },
+                authorOrDomain = extracted.author.ifBlank { "TikTok Creator" },
+                platform = MediaPlatform.TIKTOK,
+                durationMs = extracted.durationMs,
+                thumbnailUrl = extracted.thumbnailUrl,
+                supportsRangeRequests = true,
+                videoStreams = extracted.videoStreams.sortedBy { it.resolutionHeight },
+                audioStreams = extracted.audioStreams,
+                inspectionMethod = "TikTok HD No-Watermark & Original Audio Stream Extractor"
+            )
         )
     }
 }
 
 class PlatformAdapterRegistry(
     httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(12, TimeUnit.SECONDS)
-        .readTimeout(15, TimeUnit.SECONDS)
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
         .followRedirects(true)
+        .followSslRedirects(true)
         .build()
 ) {
     private val adapters: Map<MediaPlatform, PlatformMediaAdapter> = mapOf(
         MediaPlatform.AUTHORIZED_LOCAL to AuthorizedLocalMediaAdapter(),
         MediaPlatform.DIRECT_URL to DirectUrlMediaAdapter(httpClient),
         MediaPlatform.YOUTUBE to YouTubePlatformAdapter(httpClient),
-        MediaPlatform.FACEBOOK to FacebookPlatformAdapter(),
-        MediaPlatform.INSTAGRAM to InstagramPlatformAdapter(),
+        MediaPlatform.FACEBOOK to FacebookPlatformAdapter(httpClient),
+        MediaPlatform.INSTAGRAM to InstagramPlatformAdapter(httpClient),
         MediaPlatform.TIKTOK to TikTokPlatformAdapter(httpClient)
     )
 

@@ -978,9 +978,26 @@ class DownloadEngine(
         }
 
         // HTTP / HTTPS real network stream with Range header support
+        val lowerUrl = sourceUrl.lowercase()
+        val userAgent = if (lowerUrl.contains("googlevideo.com")) {
+            "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 14; en_US; Quest 3; Build/UP1A.231005.007.A1; Cronet/132.0.6808.3)"
+        } else {
+            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+        }
         val reqBuilder = Request.Builder()
             .url(sourceUrl)
-            .header("User-Agent", "MediaSave-Android/1.0")
+            .header("User-Agent", userAgent)
+            .header("Accept", "*/*")
+        when {
+            lowerUrl.contains("tiktok") || lowerUrl.contains("tikwm") || lowerUrl.contains("musical.ly") ->
+                reqBuilder.header("Referer", "https://www.tiktok.com/")
+            lowerUrl.contains("instagram") || lowerUrl.contains("cdninstagram") ->
+                reqBuilder.header("Referer", "https://www.instagram.com/")
+            lowerUrl.contains("facebook") || lowerUrl.contains("fbcdn") ->
+                reqBuilder.header("Referer", "https://www.facebook.com/")
+            lowerUrl.contains("youtube") || lowerUrl.contains("googlevideo") ->
+                reqBuilder.header("Origin", "https://www.youtube.com")
+        }
         if (existingBytes > 0L && supportsResume) {
             reqBuilder.header("Range", "bytes=$existingBytes-")
         }

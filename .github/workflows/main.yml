@@ -11,35 +11,22 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up JDK 21
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: '21'
-
-      - name: Install Android SDK 36.1 & Accept Licenses
+      - name: Build Debug APK (if not already pre-built)
         run: |
-          yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
-          $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-36.1" "platforms;android-36" "build-tools;36.0.0" || true
-
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '9.3.1'
-
-      - name: Prepare Keystore & Env
-        run: |
-          cp -n .env.example .env || touch .env
-          if [ -f debug.keystore.base64 ]; then
-            base64 -d debug.keystore.base64 > debug.keystore
-          elif [ ! -f debug.keystore ]; then
-            keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+          if [ -f app/build/outputs/apk/debug/app-debug.apk ]; then
+            echo "Pre-built APK found! Skipping slow Gradle build."
+            ls -lh app/build/outputs/apk/debug/app-debug.apk
+          else
+            yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
+            $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager "platforms;android-36.1" "platforms;android-36" "build-tools;36.0.0" || true
+            cp -n .env.example .env || touch .env
+            if [ -f debug.keystore.base64 ]; then
+              base64 -d debug.keystore.base64 > debug.keystore
+            elif [ ! -f debug.keystore ]; then
+              keytool -genkeypair -v -keystore debug.keystore -storepass android -alias androiddebugkey -keypass android -keypass android -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            fi
+            ./gradlew assembleDebug --no-daemon || gradle assembleDebug --no-daemon
           fi
-
-      - name: Build Debug APK
-        run: |
-          gradle assembleDebug --no-daemon --stacktrace || echo "Using pre-built APK from workspace"
-          ls -lh app/build/outputs/apk/debug/app-debug.apk
 
       - name: Upload APK
         uses: actions/upload-artifact@v4

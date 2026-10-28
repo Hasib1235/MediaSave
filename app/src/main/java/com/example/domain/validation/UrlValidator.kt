@@ -99,16 +99,16 @@ sealed class ClipboardParseResult {
 object UrlValidator {
 
     private val YOUTUBE_HOSTS = setOf(
-        "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com"
+        "youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be", "music.youtube.com", "youtube-nocookie.com"
     )
     private val FACEBOOK_HOSTS = setOf(
-        "facebook.com", "www.facebook.com", "m.facebook.com", "fb.watch", "fb.com"
+        "facebook.com", "www.facebook.com", "m.facebook.com", "mbasic.facebook.com", "web.facebook.com", "fb.watch", "fb.com", "www.fb.com", "fb.gg"
     )
     private val INSTAGRAM_HOSTS = setOf(
-        "instagram.com", "www.instagram.com", "instagr.am"
+        "instagram.com", "www.instagram.com", "m.instagram.com", "instagr.am", "ddinstagram.com"
     )
     private val TIKTOK_HOSTS = setOf(
-        "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com"
+        "tiktok.com", "www.tiktok.com", "vm.tiktok.com", "vt.tiktok.com", "m.tiktok.com", "v.tiktok.com"
     )
 
     private val SUPPORTED_SCHEMES = setOf("https", "http", "file")
