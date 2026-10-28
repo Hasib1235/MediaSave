@@ -28,7 +28,7 @@ object LocalSampleMediaGenerator {
         context: Context
     ): List<AuthorizedSampleItem> = withContext(Dispatchers.IO) {
         val samplesDir = File(context.filesDir, "samples").apply { mkdirs() }
-        val versionMarker = File(samplesDir, ".samples_v3_iso_mp4")
+        val versionMarker = File(samplesDir, ".samples_v4_iso_clean")
 
         val audioWavFile = File(samplesDir, "studio_synth_master_44k.wav")
         val audioM4aFile = File(samplesDir, "studio_podcast_stereo.m4a")
@@ -39,6 +39,7 @@ object LocalSampleMediaGenerator {
 
         if (!versionMarker.exists()) {
             runCatching {
+                audioM4aFile.delete()
                 video360p.delete()
                 video720p.delete()
                 video1080pVo.delete()
@@ -77,7 +78,7 @@ object LocalSampleMediaGenerator {
             writeValidIsoMp4VideoFile(video1080pProg, width = 1920, height = 1080, fps = 60, bitrate = 4_392_000, hasAudioFlag = true)
         }
 
-        runCatching { versionMarker.writeText("v3") }
+        runCatching { versionMarker.writeText("v4") }
 
         val info1080 = MediaProcessorEngine.inspectMediaFile(video1080pProg)
         val actualDurationMs = info1080.durationMs.coerceAtLeast(2000L)

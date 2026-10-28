@@ -185,6 +185,16 @@ fun VideoPlayerModal(
     var playbackSpeed by remember { mutableStateOf("1.0x") }
     var isLocked by remember { mutableStateOf(false) }
 
+    androidx.compose.runtime.DisposableEffect(Unit) {
+        onDispose {
+            runCatching {
+                videoViewRef?.pause()
+                videoViewRef?.stopPlayback()
+            }
+            videoViewRef = null
+        }
+    }
+
     androidx.compose.runtime.LaunchedEffect(videoViewRef, isPlaying) {
         while (true) {
             val vv = videoViewRef
