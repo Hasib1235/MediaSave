@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <files-path name="mediasave_downloads" path="downloads/" />
+    <files-path name="mediasave_samples" path="samples/" />
+    <external-files-path name="mediasave_external_files" path="." />
+    <cache-path name="mediasave_cache" path="." />
+</paths>

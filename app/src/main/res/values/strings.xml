@@ -1,0 +1,27 @@
+<resources>
+    <string name="app_name">MediaSave</string>
+    <string name="app_tagline">Studio-Grade Video &amp; Audio Downloader</string>
+    <string name="nav_home">Analyze</string>
+    <string name="nav_queue">Downloads</string>
+    <string name="nav_video_library">Videos</string>
+    <string name="nav_music_library">Music</string>
+    <string name="nav_settings">Settings</string>
+    <string name="mode_video">Video Downloader</string>
+    <string name="mode_music">Music / Audio</string>
+    <string name="url_input_label">Media URL or Authorized File Path</string>
+    <string name="url_input_placeholder">https://example.com/media.mp4 or select authorized source</string>
+    <string name="btn_paste">Paste Link</string>
+    <string name="btn_analyze">Analyze Link</string>
+    <string name="btn_clear">Clear</string>
+    <string name="section_recent_downloads">Recent Downloads</string>
+    <string name="section_authorized_samples">Authorized Direct Sources &amp; Local Test Bench</string>
+    <string name="section_platform_adapters">Platform Adapter Status &amp; Compliance</string>
+    <string name="error_empty_url">Please enter or paste a valid media URL.</string>
+    <string name="error_invalid_scheme">Unsupported URL scheme. Only HTTPS, HTTP, or local authorized file:// URIs are accepted.</string>
+    <string name="empty_queue_title">Download Queue is Empty</string>
+    <string name="empty_queue_subtitle">Analyze a direct media link or authorized local stream on the Home screen to start downloading or converting.</string>
+    <string name="empty_video_library_title">No Downloaded Videos Yet</string>
+    <string name="empty_video_library_subtitle">Videos downloaded or merged in Video Mode will appear here ready for instant playback.</string>
+    <string name="empty_music_library_title">No Downloaded Audio Tracks Yet</string>
+    <string name="empty_music_library_subtitle">Audio tracks downloaded or extracted in Music Mode will appear here with full waveform controls.</string>
+</resources>

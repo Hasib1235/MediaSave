@@ -1,0 +1,6 @@
+{
+  "name": "MediaSave",
+  "description": "All-in-One Video & Music Downloader with real stream inspection, multi-stage download manager, lawful audio/video muxing & conversion, and built-in media library.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

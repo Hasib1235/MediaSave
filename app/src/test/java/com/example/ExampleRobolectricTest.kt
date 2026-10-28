@@ -1,0 +1,526 @@
+package com.example
+
+import android.app.Application
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import androidx.room.Room
+import androidx.test.core.app.ApplicationProvider
+import com.example.data.download.DownloadEngine
+import com.example.data.download.EnqueueResult
+import com.example.data.local.AppDatabase
+import com.example.data.media.LocalSampleMediaGenerator
+import com.example.data.platform.PlatformAdapterRegistry
+import com.example.domain.model.AnalyzedMediaMetadata
+import com.example.domain.model.AudioFormat
+import com.example.domain.model.DownloadStatus
+import com.example.domain.model.MediaAnalysisState
+import com.example.domain.model.MediaPlatform
+import com.example.domain.model.StreamType
+import com.example.domain.model.VideoContainerFormat
+import com.example.domain.model.VideoStreamOption
+import com.example.domain.validation.UrlValidator
+import com.example.ui.MediaSaveViewModel
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.runBlocking
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Protocol
+import okhttp3.Response
+import okhttp3.ResponseBody.Companion.toResponseBody
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import org.junit.runner.RunWith
+import org.robolectric.RobolectricTestRunner
+import org.robolectric.annotation.Config
+import java.io.File
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [36])
+class ExampleRobolectricTest {
+
+    @Test
+    fun `app name resource is MediaSave`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val appName = context.getString(R.string.app_name)
+        assertEquals("MediaSave", appName)
+    }
+
+    @Test
+    fun `clipboard paste handles empty clipboard valid url and invalid clipboard text`() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val clipboard = app.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        val viewModel = MediaSaveViewModel(app)
+
+        // 1. Empty clipboard should NOT insert a sample URI and must show a clear message
+        clipboard.clearPrimaryClip()
+        viewModel.clearUrlInput()
+        viewModel.pasteFromClipboard(null)
+
+        assertEquals("", viewModel.urlInput.value)
+        val emptyState = viewModel.analysisState.value
+        assertTrue(emptyState is MediaAnalysisState.Error)
+        assertEquals("Clipboard is Empty", (emptyState as MediaAnalysisState.Error).errorTitle)
+        assertTrue(viewModel.snackbarMessage.value.orEmpty().contains("Clipboard is empty"))
+
+        // 2. Valid URL on Android clipboard is read and inserted into urlInput
+        val validUrl = "https://www.w3schools.com/html/mov_bbb.mp4"
+        clipboard.setPrimaryClip(ClipData.newPlainText("media_url", validUrl))
+        viewModel.pasteFromClipboard(null)
+
+        assertEquals(validUrl, viewModel.urlInput.value)
+        assertEquals(MediaAnalysisState.Idle, viewModel.analysisState.value)
+
+        // 3. Invalid text on Android clipboard is inserted into urlInput and flagged with a validation error
+        clipboard.setPrimaryClip(ClipData.newPlainText("bad_text", "not_a_valid_url_at_all"))
+        viewModel.pasteFromClipboard(null)
+
+        assertEquals("not_a_valid_url_at_all", viewModel.urlInput.value)
+        assertTrue(viewModel.analysisState.value is MediaAnalysisState.Error)
+    }
+
+    @Test
+    fun `platform adapter registry enforces compliance for restricted platforms and parses authorized local manifests`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val samples = LocalSampleMediaGenerator.ensureAuthorizedSamplesReady(context)
+        assertTrue(samples.isNotEmpty())
+
+        val registry = PlatformAdapterRegistry()
+
+        // 1. Authorized multi-resolution local manifest should succeed with multiple sorted resolutions
+        val multiVideoSample = samples.first { it.id == "sample_multi_video" }
+        val analysis = registry.validateAndAnalyze(multiVideoSample.uri)
+        assertTrue(analysis is MediaAnalysisState.Success)
+        val success = analysis as MediaAnalysisState.Success
+        assertTrue(success.metadata.videoStreams.size >= 3)
+        // Resolutions must be ordered from lowest to highest
+        val heights = success.metadata.videoStreams.map { it.resolutionHeight }
+        assertEquals(heights.sorted(), heights)
+
+        // 2. Direct single-file URI should be inspected for real container/tracks
+        val wavSample = samples.first { it.id == "sample_master_wav" }
+        val wavAnalysis = registry.validateAndAnalyze(wavSample.uri)
+        assertTrue(wavAnalysis is MediaAnalysisState.Success)
+        val wavMeta = (wavAnalysis as MediaAnalysisState.Success).metadata
+        assertTrue(wavMeta.audioStreams.isNotEmpty())
+        assertEquals(AudioFormat.WAV, wavMeta.audioStreams.first().sourceFormat)
+
+        // 3. Restricted social URLs (YouTube, Facebook, Instagram, TikTok) must return PlatformRestricted rather than faking downloads
+        val ytState = registry.validateAndAnalyze("https://www.youtube.com/watch?v=dQw4w9WgXcQ")
+        assertTrue(ytState is MediaAnalysisState.PlatformRestricted)
+        assertEquals(MediaPlatform.YOUTUBE, (ytState as MediaAnalysisState.PlatformRestricted).platform)
+
+        val fbState = registry.validateAndAnalyze("https://www.facebook.com/watch/?v=123456789")
+        assertTrue(fbState is MediaAnalysisState.PlatformRestricted)
+        assertEquals(MediaPlatform.FACEBOOK, (fbState as MediaAnalysisState.PlatformRestricted).platform)
+
+        val igState = registry.validateAndAnalyze("https://www.instagram.com/reel/C8xYz123AbC/")
+        assertTrue(igState is MediaAnalysisState.PlatformRestricted)
+        assertEquals(MediaPlatform.INSTAGRAM, (igState as MediaAnalysisState.PlatformRestricted).platform)
+
+        val ttState = registry.validateAndAnalyze("https://www.tiktok.com/@creator/video/734567890")
+        assertTrue(ttState is MediaAnalysisState.PlatformRestricted)
+        assertEquals(MediaPlatform.TIKTOK, (ttState as MediaAnalysisState.PlatformRestricted).platform)
+    }
+
+    @Test
+    fun `download engine executes real video download and audio format conversion with progress and checksum`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val dao = db.downloadTaskDao()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+        val engine = DownloadEngine(context, dao, scope)
+        val registry = PlatformAdapterRegistry()
+
+        val samples = LocalSampleMediaGenerator.ensureAuthorizedSamplesReady(context)
+        val videoSample = samples.first { it.id == "sample_multi_video" }
+        val analysis = registry.validateAndAnalyze(videoSample.uri) as MediaAnalysisState.Success
+        val stream720p = analysis.metadata.videoStreams.first { it.resolutionHeight == 720 }
+
+        val enqueueRes = engine.enqueueVideoDownload(
+            metadata = analysis.metadata,
+            stream = stream720p,
+            allowDuplicate = true
+        )
+        assertTrue(enqueueRes is EnqueueResult.Enqueued)
+        val taskId = (enqueueRes as EnqueueResult.Enqueued).task.id
+
+        // Wait for real file transfer to complete
+        var completedTask = dao.getTaskById(taskId)
+        var attempts = 0
+        while (completedTask?.statusEnum != DownloadStatus.COMPLETED && attempts < 60) {
+            delay(100)
+            completedTask = dao.getTaskById(taskId)
+            attempts++
+        }
+
+        assertNotNull(completedTask)
+        assertEquals(DownloadStatus.COMPLETED, completedTask!!.statusEnum)
+        assertEquals(100, completedTask.progressPercent)
+        assertNotNull(completedTask.checksumSha256)
+
+        val downloadedFile = File(completedTask.outputFilePath)
+        assertTrue(downloadedFile.exists())
+        assertTrue(downloadedFile.length() > 0L)
+
+        // Test Audio Download & AIFF conversion from WAV master
+        val wavSample = samples.first { it.id == "sample_master_wav" }
+        val wavAnalysis = registry.validateAndAnalyze(wavSample.uri) as MediaAnalysisState.Success
+        val wavSourceStream = wavAnalysis.metadata.audioStreams.first()
+        val aiffChoice = UrlValidator.buildSupportedAudioOutputChoices(wavSourceStream)
+            .first { it.targetFormat == AudioFormat.AIFF }
+
+        val audioEnqueue = engine.enqueueAudioDownload(
+            metadata = wavAnalysis.metadata,
+            sourceStream = wavSourceStream,
+            outputChoice = aiffChoice,
+            allowDuplicate = true
+        )
+        assertTrue(audioEnqueue is EnqueueResult.Enqueued)
+        val audioTaskId = (audioEnqueue as EnqueueResult.Enqueued).task.id
+
+        var completedAudio = dao.getTaskById(audioTaskId)
+        attempts = 0
+        while (completedAudio?.statusEnum != DownloadStatus.COMPLETED && attempts < 60) {
+            delay(100)
+            completedAudio = dao.getTaskById(audioTaskId)
+            attempts++
+        }
+
+        assertNotNull(completedAudio)
+        assertEquals(DownloadStatus.COMPLETED, completedAudio!!.statusEnum)
+        assertEquals(AudioFormat.AIFF.label, completedAudio.containerFormat)
+        assertEquals("AIFF", completedAudio.targetAudioFormat)
+        val aiffFile = File(completedAudio.outputFilePath)
+        assertTrue(aiffFile.exists())
+        assertTrue(aiffFile.length() > 54L)
+
+        // Test deleting task and file
+        engine.deleteTaskAndFile(taskId)
+        engine.deleteTaskAndFile(audioTaskId)
+        db.close()
+    }
+
+    @Test
+    fun `download engine handles real http streams and rejects mock urls 404 expired 410 and html webpages`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val dao = db.downloadTaskDao()
+        val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+        val validMp4Payload = ByteArray(4096) { idx ->
+            when (idx) {
+                0, 1, 2 -> 0
+                3 -> 24
+                4 -> 'f'.code.toByte()
+                5 -> 't'.code.toByte()
+                6 -> 'y'.code.toByte()
+                7 -> 'p'.code.toByte()
+                else -> (idx % 251).toByte()
+            }
+        }
+
+        val testHttpClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                val url = req.url.toString()
+                when {
+                    url.contains("valid_video.mp4") -> {
+                        Response.Builder()
+                            .request(req)
+                            .protocol(Protocol.HTTP_1_1)
+                            .code(200)
+                            .message("OK")
+                            .header("Content-Type", "video/mp4")
+                            .header("Content-Length", validMp4Payload.size.toString())
+                            .body(validMp4Payload.toResponseBody("video/mp4".toMediaType()))
+                            .build()
+                    }
+                    url.contains("missing_video.mp4") -> {
+                        Response.Builder()
+                            .request(req)
+                            .protocol(Protocol.HTTP_1_1)
+                            .code(404)
+                            .message("Not Found")
+                            .body("Not Found".toResponseBody("text/plain".toMediaType()))
+                            .build()
+                    }
+                    url.contains("expired_video.mp4") -> {
+                        Response.Builder()
+                            .request(req)
+                            .protocol(Protocol.HTTP_1_1)
+                            .code(410)
+                            .message("Gone")
+                            .body("Gone".toResponseBody("text/plain".toMediaType()))
+                            .build()
+                    }
+                    url.contains("webpage_disguised.mp4") -> {
+                        val html = "<!DOCTYPE html><html><body>Login required</body></html>"
+                        Response.Builder()
+                            .request(req)
+                            .protocol(Protocol.HTTP_1_1)
+                            .code(200)
+                            .message("OK")
+                            .header("Content-Type", "text/html; charset=utf-8")
+                            .body(html.toResponseBody("text/html".toMediaType()))
+                            .build()
+                    }
+                    else -> {
+                        Response.Builder()
+                            .request(req)
+                            .protocol(Protocol.HTTP_1_1)
+                            .code(500)
+                            .message("Server Error")
+                            .body("Error".toResponseBody("text/plain".toMediaType()))
+                            .build()
+                    }
+                }
+            }
+            .build()
+
+        val engine = DownloadEngine(context, dao, scope, testHttpClient)
+        val registry = PlatformAdapterRegistry(testHttpClient)
+
+        // 1. Mock metadata URL must be rejected immediately and never enqueued
+        val mockMeta = AnalyzedMediaMetadata(
+            sourceUrl = "mock://video/sample.mp4",
+            title = "Mock Video",
+            authorOrDomain = "Mock",
+            platform = MediaPlatform.DIRECT_URL,
+            durationMs = 1000L,
+            thumbnailUrl = null,
+            supportsRangeRequests = false,
+            videoStreams = emptyList(),
+            audioStreams = emptyList(),
+            inspectionMethod = "Test"
+        )
+        val mockStream = VideoStreamOption(
+            id = "mock_1",
+            resolutionHeight = 720,
+            resolutionWidth = 1280,
+            resolutionLabel = "720p HD",
+            videoCodec = "H.264",
+            audioCodec = "AAC",
+            container = VideoContainerFormat.MP4,
+            streamType = StreamType.PROGRESSIVE,
+            frameRate = 30,
+            isHdr = false,
+            bitrateKbps = 1000,
+            estimatedSizeBytes = 1024L,
+            downloadUrl = "mock://video/sample.mp4"
+        )
+        val mockEnqueue = engine.enqueueVideoDownload(mockMeta, mockStream, allowDuplicate = true)
+        assertTrue(mockEnqueue is EnqueueResult.Rejected)
+
+        // 2. Webpage disguised with .mp4 extension must be rejected during analysis
+        val htmlAnalysis = registry.validateAndAnalyze("https://cdn.example.org/webpage_disguised.mp4")
+        assertTrue(htmlAnalysis is MediaAnalysisState.Error)
+        assertEquals(
+            "Webpage Instead of Direct Media Stream",
+            (htmlAnalysis as MediaAnalysisState.Error).errorTitle
+        )
+
+        // 3. Valid HTTP 200 MP4 stream downloads, verifies size/checksum, and completes
+        val validUrl = "https://cdn.example.org/valid_video.mp4"
+        val validStream = mockStream.copy(
+            id = "http_valid",
+            estimatedSizeBytes = validMp4Payload.size.toLong(),
+            downloadUrl = validUrl
+        )
+        val validEnqueue = engine.enqueueVideoDownload(
+            mockMeta.copy(sourceUrl = validUrl, title = "HTTP Valid Clip"),
+            validStream,
+            allowDuplicate = true
+        )
+        assertTrue(validEnqueue is EnqueueResult.Enqueued)
+        val validTaskId = (validEnqueue as EnqueueResult.Enqueued).task.id
+
+        var validTask = dao.getTaskById(validTaskId)
+        var attempts = 0
+        while (validTask?.statusEnum?.isActive == true && attempts < 40) {
+            delay(50)
+            validTask = dao.getTaskById(validTaskId)
+            attempts++
+        }
+        assertNotNull(validTask)
+        assertEquals(DownloadStatus.COMPLETED, validTask!!.statusEnum)
+        assertEquals(validMp4Payload.size.toLong(), File(validTask.outputFilePath).length())
+
+        // 4. HTTP 404 Not Found transitions task to FAILED with meaningful 404 message
+        val missingUrl = "https://cdn.example.org/missing_video.mp4"
+        val missingEnqueue = engine.enqueueVideoDownload(
+            mockMeta.copy(sourceUrl = missingUrl, title = "Missing Clip"),
+            validStream.copy(id = "http_404", downloadUrl = missingUrl),
+            allowDuplicate = true
+        )
+        val missingTaskId = (missingEnqueue as EnqueueResult.Enqueued).task.id
+        var missingTask = dao.getTaskById(missingTaskId)
+        attempts = 0
+        while (missingTask?.statusEnum?.isActive == true && attempts < 40) {
+            delay(50)
+            missingTask = dao.getTaskById(missingTaskId)
+            attempts++
+        }
+        assertNotNull(missingTask)
+        assertEquals(DownloadStatus.FAILED, missingTask!!.statusEnum)
+        assertTrue(missingTask.errorMessage.orEmpty().contains("404"))
+        assertNull(missingTask.completedAt)
+
+        // 5. HTTP 410 Expired Link transitions task to FAILED with expired link message
+        val expiredUrl = "https://cdn.example.org/expired_video.mp4"
+        val expiredEnqueue = engine.enqueueVideoDownload(
+            mockMeta.copy(sourceUrl = expiredUrl, title = "Expired Clip"),
+            validStream.copy(id = "http_410", downloadUrl = expiredUrl),
+            allowDuplicate = true
+        )
+        val expiredTaskId = (expiredEnqueue as EnqueueResult.Enqueued).task.id
+        var expiredTask = dao.getTaskById(expiredTaskId)
+        attempts = 0
+        while (expiredTask?.statusEnum?.isActive == true && attempts < 40) {
+            delay(50)
+            expiredTask = dao.getTaskById(expiredTaskId)
+            attempts++
+        }
+        assertNotNull(expiredTask)
+        assertEquals(DownloadStatus.FAILED, expiredTask!!.statusEnum)
+        assertTrue(expiredTask.errorMessage.orEmpty().contains("expired", ignoreCase = true))
+
+        db.close()
+    }
+
+    @Test
+    fun `social media icons open external platform urls without routing to test media or modifying url input`() {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val shadowApp = org.robolectric.Shadows.shadowOf(app)
+        val viewModel = MediaSaveViewModel(app)
+        viewModel.clearUrlInput()
+
+        val expectedPlatforms = listOf(
+            "YouTube" to "https://www.youtube.com/",
+            "Facebook" to "https://www.facebook.com/",
+            "Instagram" to "https://www.instagram.com/",
+            "TikTok" to "https://www.tiktok.com/"
+        )
+
+        for ((name, expectedUrl) in expectedPlatforms) {
+            val result = viewModel.openSocialPlatform(name)
+            assertTrue(
+                result is com.example.domain.validation.SocialPlatformLaunchResult.LaunchedBrowser ||
+                    result is com.example.domain.validation.SocialPlatformLaunchResult.LaunchedOfficialApp
+            )
+            // Must NOT inject sample URLs into urlInput or trigger analysis/test-media screen
+            assertEquals("", viewModel.urlInput.value)
+            assertEquals(MediaAnalysisState.Idle, viewModel.analysisState.value)
+
+            val startedIntent = shadowApp.nextStartedActivity
+            assertNotNull("Expected ACTION_VIEW intent for $name", startedIntent)
+            assertEquals(android.content.Intent.ACTION_VIEW, startedIntent.action)
+            assertEquals(expectedUrl, startedIntent.dataString)
+        }
+    }
+
+    @Test
+    fun `download engine classifies all error types specifically and recovers interrupted tasks on startup`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val dao = db.downloadTaskDao()
+
+        // Insert a task stuck in DOWNLOADING state from a previous killed session
+        dao.upsertTask(
+            com.example.domain.model.DownloadTaskEntity(
+                id = "stuck_1",
+                sourceUrl = "https://cdn.example.org/video.mp4",
+                title = "Interrupted Video",
+                author = "CDN",
+                platformName = "Direct Media URL",
+                mode = "VIDEO",
+                outputFilePath = "/tmp/interrupted.mp4",
+                fileName = "interrupted.mp4",
+                mimeType = "video/mp4",
+                containerFormat = "MP4",
+                codecInfo = "H.264",
+                totalBytes = 10_000_000L,
+                downloadedBytes = 4_000_000L,
+                status = DownloadStatus.DOWNLOADING.name,
+                statusDetail = "Downloading..."
+            )
+        )
+
+        val recoveredCount = dao.recoverInterruptedTasksOnStartup()
+        assertEquals(1, recoveredCount)
+        val recoveredTask = dao.getTaskById("stuck_1")
+        assertNotNull(recoveredTask)
+        assertEquals(DownloadStatus.PAUSED, recoveredTask!!.statusEnum)
+        assertTrue(recoveredTask.statusDetail.contains("Interrupted by app restart"))
+
+        val engine = DownloadEngine(context, dao)
+        val exceptionsToTest = listOf(
+            java.net.UnknownHostException("media.example.org"),
+            java.net.SocketTimeoutException("Read timed out"),
+            java.net.ConnectException("Connection refused"),
+            javax.net.ssl.SSLException("Handshake failed"),
+            SecurityException("Permission denied"),
+            java.io.FileNotFoundException("/storage/missing.mp4"),
+            java.io.EOFException("Premature EOF"),
+            java.io.IOException("write failed: ENOSPC (No space left on device)"),
+            IllegalArgumentException("Invalid URL"),
+            IllegalStateException("Conversion failure")
+        )
+
+        for (ex in exceptionsToTest) {
+            val formatted = engine.formatDownloadExceptionMessage(ex)
+            assertTrue(formatted.isNotBlank())
+            org.junit.Assert.assertFalse(
+                "Error message should be specific and never fall back to generic 'Unexpected network or media storage error.'",
+                formatted.contains("Unexpected network or media storage error")
+            )
+        }
+
+        db.close()
+    }
+
+    @Test
+    fun `manifest permissions and storage cleanup adhere to least privilege and MediaStore requirements`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+        val pkgInfo = app.packageManager.getPackageInfo(
+            app.packageName,
+            android.content.pm.PackageManager.GET_PERMISSIONS
+        )
+        val requestedPermissions = pkgInfo.requestedPermissions?.toSet().orEmpty()
+
+        // Required permissions must be declared
+        assertTrue(requestedPermissions.contains(android.Manifest.permission.INTERNET))
+        assertTrue(requestedPermissions.contains(android.Manifest.permission.ACCESS_NETWORK_STATE))
+        assertTrue(requestedPermissions.contains(android.Manifest.permission.POST_NOTIFICATIONS))
+
+        // Unnecessary broad/legacy storage permissions must NOT be declared
+        org.junit.Assert.assertFalse(requestedPermissions.contains(android.Manifest.permission.READ_EXTERNAL_STORAGE))
+        org.junit.Assert.assertFalse(requestedPermissions.contains(android.Manifest.permission.WRITE_EXTERNAL_STORAGE))
+        org.junit.Assert.assertFalse(requestedPermissions.contains(android.Manifest.permission.READ_MEDIA_VIDEO))
+        org.junit.Assert.assertFalse(requestedPermissions.contains(android.Manifest.permission.READ_MEDIA_AUDIO))
+
+        // Verify custom SAF download folder setting and reset
+        val viewModel = MediaSaveViewModel(app)
+        val safUri = android.net.Uri.parse("content://com.android.externalstorage.documents/tree/primary%3ADownload%2FMyCustomMedia")
+        viewModel.setCustomDownloadLocation(safUri)
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        assertEquals("Custom download location set to /storage/emulated/0/Download/MyCustomMedia", viewModel.snackbarMessage.value)
+
+        viewModel.resetCustomDownloadLocation()
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+        assertTrue(viewModel.snackbarMessage.value.orEmpty().contains("MediaStore"))
+    }
+}
+
