@@ -748,4 +748,112 @@ class ExampleRobolectricTest {
         assertTrue("Starting download from Share Intent must navigate to active download screen", navigatedToQueue)
         assertTrue(viewModel.showActiveDownloadingScreen.value)
     }
+
+    @Test
+    fun `http 403 forbidden stream automatically recovers via fallback client headers or fresh stream resolution`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val dao = db.downloadTaskDao()
+        val validMp4Payload = ByteArray(8192) { (it % 251).toByte() }
+
+        // Simulate a googlevideo.com stream that returns HTTP 403 on MWEB/browser User-Agent,
+        // and recovers automatically when DownloadEngine retries with ANDROID_VR / fresh stream resolution
+        val recoveryHttpClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                val url = req.url.toString()
+                val ua = req.header("User-Agent").orEmpty()
+                when {
+                    url.contains("googlevideo.com/videoplayback") && ua.contains("youtube.vr.oculus") -> {
+                        Response.Builder()
+                            .request(req)
+                            .protocol(Protocol.HTTP_1_1)
+                            .code(206)
+                            .message("Partial Content")
+                            .header("Content-Type", "video/mp4")
+                            .header("Content-Length", validMp4Payload.size.toString())
+                            .body(validMp4Payload.toResponseBody("video/mp4".toMediaType()))
+                            .build()
+                    }
+                    url.contains("googlevideo.com/videoplayback") -> {
+                        Response.Builder()
+                            .request(req)
+                            .protocol(Protocol.HTTP_1_1)
+                            .code(403)
+                            .message("Forbidden")
+                            .body("Forbidden".toResponseBody("text/plain".toMediaType()))
+                            .build()
+                    }
+                    else -> {
+                        Response.Builder()
+                            .request(req)
+                            .protocol(Protocol.HTTP_1_1)
+                            .code(404)
+                            .message("Not Found")
+                            .body("Not Found".toResponseBody("text/plain".toMediaType()))
+                            .build()
+                    }
+                }
+            }
+            .build()
+
+        val engine = DownloadEngine(
+            context = context,
+            dao = dao,
+            externalScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+            httpClient = recoveryHttpClient
+        )
+
+        // Enqueue a stream initially tagged with c=MWEB (which returns 403 on initial mobile browser UA)
+        val mwebStream = VideoStreamOption(
+            id = "yt_prog_360p_18",
+            resolutionLabel = "360p SD",
+            resolutionWidth = 640,
+            resolutionHeight = 360,
+            frameRate = 30,
+            isHdr = false,
+            container = VideoContainerFormat.MP4,
+            videoCodec = "H.264",
+            audioCodec = "AAC",
+            streamType = StreamType.PROGRESSIVE,
+            bitrateKbps = 800,
+            estimatedSizeBytes = validMp4Payload.size.toLong(),
+            downloadUrl = "https://rr2---sn-test.googlevideo.com/videoplayback?itag=18&c=MWEB#ytid=dQw4w9WgXcQ"
+        )
+        val meta = AnalyzedMediaMetadata(
+            sourceUrl = "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            title = "403 Recovery Clip",
+            authorOrDomain = "YouTube Creator",
+            platform = MediaPlatform.YOUTUBE,
+            durationMs = 10_000L,
+            thumbnailUrl = "https://i.ytimg.com/vi/dQw4w9WgXcQ/hqdefault.jpg",
+            supportsRangeRequests = true,
+            videoStreams = listOf(mwebStream),
+            audioStreams = emptyList(),
+            inspectionMethod = "Test"
+        )
+
+        val enqueued = engine.enqueueVideoDownload(meta, mwebStream, allowDuplicate = true)
+        assertTrue(enqueued is EnqueueResult.Enqueued)
+        val taskId = (enqueued as EnqueueResult.Enqueued).task.id
+
+        var finalTask = dao.getTaskById(taskId)
+        var attempts = 0
+        while (finalTask?.statusEnum?.isActive == true && attempts < 50) {
+            delay(50)
+            finalTask = dao.getTaskById(taskId)
+            attempts++
+        }
+
+        assertNotNull(finalTask)
+        assertEquals(
+            "Expected HTTP 403 stream to recover and complete, but got: ${finalTask?.errorMessage}",
+            DownloadStatus.COMPLETED,
+            finalTask?.statusEnum
+        )
+        assertEquals(validMp4Payload.size.toLong(), File(finalTask!!.outputFilePath).length())
+        db.close()
+    }
 }

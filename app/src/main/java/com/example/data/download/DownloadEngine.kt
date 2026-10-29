@@ -21,6 +21,7 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import com.example.data.local.DownloadTaskDao
 import com.example.data.media.MediaProcessorEngine
+import com.example.data.platform.SocialStreamExtractor
 import com.example.domain.model.AnalyzedMediaMetadata
 import com.example.domain.model.AudioFormat
 import com.example.domain.model.AudioOutputChoice
@@ -84,6 +85,7 @@ class DownloadEngine(
         .build()
 ) {
     private val activeJobs = ConcurrentHashMap<String, Job>()
+    private val taskOriginUrls = ConcurrentHashMap<String, String>()
     @Volatile
     private var concurrencySemaphore = Semaphore(3)
     @Volatile
@@ -222,6 +224,9 @@ class DownloadEngine(
             requiresStreamMerge = stream.streamType == StreamType.VIDEO_ONLY && stream.pairedAudioStreamUrl != null
         )
 
+        if (metadata.sourceUrl.isNotBlank()) {
+            taskOriginUrls[id] = metadata.sourceUrl
+        }
         dao.upsertTask(task)
         startTaskExecution(task.id)
         EnqueueResult.Enqueued(task)
@@ -297,6 +302,9 @@ class DownloadEngine(
             conversionNote = outputChoice.warningMessage ?: outputChoice.description
         )
 
+        if (metadata.sourceUrl.isNotBlank()) {
+            taskOriginUrls[id] = metadata.sourceUrl
+        }
         dao.upsertTask(task)
         startTaskExecution(task.id)
         EnqueueResult.Enqueued(task)
@@ -904,7 +912,8 @@ class DownloadEngine(
         targetPartFile: File,
         supportsResume: Boolean,
         knownTotalBytes: Long,
-        baseByteOffset: Long
+        baseByteOffset: Long,
+        recoveryDepth: Int = 0
     ): Unit = withContext(Dispatchers.IO) {
         targetPartFile.parentFile?.mkdirs()
         var existingBytes = if (supportsResume && targetPartFile.exists()) targetPartFile.length() else 0L
@@ -977,41 +986,83 @@ class DownloadEngine(
             return@withContext
         }
 
-        // HTTP / HTTPS real network stream with Range header support
-        val lowerUrl = sourceUrl.lowercase()
-        val userAgent = when {
-            lowerUrl.contains("googlevideo.com") && lowerUrl.contains("c=ios") ->
-                "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)"
-            lowerUrl.contains("googlevideo.com") && lowerUrl.contains("c=android_vr") ->
-                "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; en_US; eureka-user Build/SQ3A.220605.009.A1) gzip"
-            lowerUrl.contains("googlevideo.com") && lowerUrl.contains("c=android") ->
-                "com.google.android.youtube/20.03.35 (Linux; U; Android 14; en_US) gzip"
-            lowerUrl.contains("googlevideo.com") ->
-                "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-            else ->
-                "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
-        }
-        val reqBuilder = Request.Builder()
-            .url(sourceUrl)
-            .header("User-Agent", userAgent)
-            .header("Accept", "*/*")
-        when {
-            lowerUrl.contains("tiktok") || lowerUrl.contains("tikwm") || lowerUrl.contains("musical.ly") ->
-                reqBuilder.header("Referer", "https://www.tiktok.com/")
-            lowerUrl.contains("instagram") || lowerUrl.contains("cdninstagram") ->
-                reqBuilder.header("Referer", "https://www.instagram.com/")
-            lowerUrl.contains("facebook") || lowerUrl.contains("fbcdn") ->
-                reqBuilder.header("Referer", "https://www.facebook.com/")
-            lowerUrl.contains("googlevideo.com") && (lowerUrl.contains("c=web") || lowerUrl.contains("c=mweb") || lowerUrl.contains("c=tvhtml5")) -> {
-                reqBuilder.header("Origin", "https://www.youtube.com")
-                reqBuilder.header("Referer", "https://www.youtube.com/")
-            }
+        // HTTP / HTTPS real network stream with client-matched headers and automatic 403 recovery
+        val cleanUrl = SocialStreamExtractor.stripUrlFragment(sourceUrl)
+        val lowerUrl = cleanUrl.lowercase()
+        val reqBuilder = Request.Builder().url(cleanUrl)
+        for ((headerName, headerVal) in SocialStreamExtractor.buildStreamRequestHeaders(cleanUrl)) {
+            reqBuilder.header(headerName, headerVal)
         }
         if (existingBytes > 0L && supportsResume) {
             reqBuilder.header("Range", "bytes=$existingBytes-")
+        } else if (lowerUrl.contains("googlevideo.com") && !lowerUrl.contains("range=")) {
+            reqBuilder.header("Range", "bytes=0-")
         }
 
-        httpClient.newCall(reqBuilder.build()).execute().use { response ->
+        val initialResponse = httpClient.newCall(reqBuilder.build()).execute()
+        val activeResponse = if (initialResponse.code in listOf(401, 403, 410)) {
+            val initialCode = initialResponse.code
+            initialResponse.close()
+
+            // Step A: Try alternative User-Agent / Range / Referer header profiles on the same URL
+            val altResponse = tryAlternativeHeaderProfiles(cleanUrl, existingBytes, supportsResume)
+            if (altResponse != null) {
+                altResponse
+            } else if (recoveryDepth < 2) {
+                // Step B: Resolve a fresh, non-403 stream URL on the fly via SocialStreamExtractor
+                val currentTask = dao.getTaskById(taskId)
+                dao.updateProgress(
+                    id = taskId,
+                    downloadedBytes = existingBytes,
+                    totalBytes = knownTotalBytes,
+                    speedBytesPerSec = 0L,
+                    etaSeconds = -1L,
+                    status = DownloadStatus.DOWNLOADING.name,
+                    statusDetail = "Refreshing media stream link (bypassing HTTP $initialCode)..."
+                )
+                val freshUrl = SocialStreamExtractor.resolveFreshStreamUrlOn403(
+                    httpClient = httpClient,
+                    failedUrl = sourceUrl,
+                    originPageUrl = taskOriginUrls[taskId],
+                    thumbnailUrl = currentTask?.thumbnailUrl,
+                    isAudio = currentTask?.mode == DownloaderMode.MUSIC.name || baseByteOffset > 0L,
+                    preferredHeight = currentTask?.height ?: 720
+                )
+                if (!freshUrl.isNullOrBlank() && SocialStreamExtractor.stripUrlFragment(freshUrl) != cleanUrl) {
+                    if (currentTask != null && baseByteOffset == 0L) {
+                        dao.upsertTask(currentTask.copy(sourceUrl = freshUrl))
+                    }
+                    if (targetPartFile.exists()) targetPartFile.delete()
+                    transferStreamToFile(
+                        taskId = taskId,
+                        sourceUrl = freshUrl,
+                        targetPartFile = targetPartFile,
+                        supportsResume = supportsResume,
+                        knownTotalBytes = knownTotalBytes,
+                        baseByteOffset = baseByteOffset,
+                        recoveryDepth = recoveryDepth + 1
+                    )
+                    return@withContext
+                }
+                val unrecoverableMsg = if (initialCode == 410) {
+                    "Media link has expired and is no longer available (HTTP 410)."
+                } else {
+                    "Access denied or expired media link (HTTP $initialCode). Please re-analyze the source URL."
+                }
+                throw IOException(unrecoverableMsg)
+            } else {
+                val unrecoverableMsg = if (initialCode == 410) {
+                    "Media link has expired and is no longer available (HTTP 410)."
+                } else {
+                    "Access denied or expired media link (HTTP $initialCode). Please re-analyze the source URL."
+                }
+                throw IOException(unrecoverableMsg)
+            }
+        } else {
+            initialResponse
+        }
+
+        activeResponse.use { response ->
             // If Range is not satisfiable (HTTP 416), reset partial file and retry from byte 0
             if (response.code == 416 && existingBytes > 0L) {
                 response.close()
@@ -1022,7 +1073,8 @@ class DownloadEngine(
                     targetPartFile = targetPartFile,
                     supportsResume = false,
                     knownTotalBytes = knownTotalBytes,
-                    baseByteOffset = baseByteOffset
+                    baseByteOffset = baseByteOffset,
+                    recoveryDepth = recoveryDepth
                 )
                 return@withContext
             }
@@ -1138,6 +1190,50 @@ class DownloadEngine(
                 }
             }
         }
+    }
+
+    private fun tryAlternativeHeaderProfiles(
+        cleanUrl: String,
+        existingBytes: Long,
+        supportsResume: Boolean
+    ): okhttp3.Response? {
+        val candidateProfiles = listOf(
+            mapOf(
+                "User-Agent" to "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; en_US; eureka-user Build/SQ3A.220605.009.A1) gzip",
+                "Accept" to "*/*",
+                "Range" to if (existingBytes > 0L && supportsResume) "bytes=$existingBytes-" else "bytes=0-"
+            ),
+            mapOf(
+                "User-Agent" to "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)",
+                "Accept" to "*/*",
+                "Range" to if (existingBytes > 0L && supportsResume) "bytes=$existingBytes-" else "bytes=0-"
+            ),
+            mapOf(
+                "User-Agent" to "com.google.android.youtube/1.9 (Linux; U; Android 12; en_US) gzip",
+                "Accept" to "*/*"
+            ),
+            mapOf(
+                "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                "Accept" to "*/*",
+                "Origin" to "https://www.youtube.com",
+                "Referer" to "https://www.youtube.com/"
+            )
+        )
+        for (headers in candidateProfiles) {
+            try {
+                val rb = Request.Builder().url(cleanUrl).get()
+                for ((k, v) in headers) {
+                    rb.header(k, v)
+                }
+                val resp = httpClient.newCall(rb.build()).execute()
+                if (resp.isSuccessful) {
+                    return resp
+                }
+                resp.close()
+            } catch (_: Exception) {
+            }
+        }
+        return null
     }
 
     private fun ensureUniqueFileName(desiredName: String): String {

@@ -403,8 +403,7 @@ object SocialStreamExtractor {
 
     private data class YouTubePageContext(
         val visitorData: String? = null,
-        val signatureTimestamp: Int? = null,
-        val embeddedStreams: ExtractedSocialStreams? = null
+        val signatureTimestamp: Int? = null
     )
 
     private data class InnerTubeClientProfile(
@@ -444,6 +443,16 @@ object SocialStreamExtractor {
             deviceModel = "iPhone16,2"
         ),
         InnerTubeClientProfile(
+            clientName = "ANDROID_TESTSUITE",
+            clientVersion = "1.9",
+            clientIdHeader = "30",
+            userAgent = "com.google.android.youtube/1.9 (Linux; U; Android 12; en_US) gzip",
+            osName = "Android",
+            osVersion = "12",
+            androidSdkVersion = 31,
+            playerParams = "CgIQBg=="
+        ),
+        InnerTubeClientProfile(
             clientName = "ANDROID",
             clientVersion = "20.03.35",
             clientIdHeader = "3",
@@ -461,24 +470,149 @@ object SocialStreamExtractor {
             osName = "PlayStation",
             osVersion = "12.00",
             isEmbedded = true
-        ),
-        InnerTubeClientProfile(
-            clientName = "MWEB",
-            clientVersion = "2.20250115.01.00",
-            clientIdHeader = "2",
-            userAgent = MOBILE_USER_AGENT,
-            osName = "Android",
-            osVersion = "14",
-            playerParams = "CgIQBg=="
         )
     )
+
+    fun stripUrlFragment(url: String): String = url.substringBefore('#').trim()
+
+    fun buildStreamRequestHeaders(url: String): Map<String, String> {
+        val cleanUrl = stripUrlFragment(url)
+        val lowerUrl = cleanUrl.lowercase()
+        val headers = LinkedHashMap<String, String>()
+
+        val userAgent = when {
+            lowerUrl.contains("googlevideo.com") && lowerUrl.contains("c=ios") ->
+                "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)"
+            lowerUrl.contains("googlevideo.com") && lowerUrl.contains("c=android_vr") ->
+                "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; en_US; eureka-user Build/SQ3A.220605.009.A1) gzip"
+            lowerUrl.contains("googlevideo.com") && lowerUrl.contains("c=android_testsuite") ->
+                "com.google.android.youtube/1.9 (Linux; U; Android 12; en_US) gzip"
+            lowerUrl.contains("googlevideo.com") && lowerUrl.contains("c=android") ->
+                "com.google.android.youtube/20.03.35 (Linux; U; Android 14; en_US) gzip"
+            lowerUrl.contains("googlevideo.com") && lowerUrl.contains("c=tvhtml5") ->
+                "Mozilla/5.0 (PlayStation; PlayStation 4/12.00) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.4 Safari/605.1.15"
+            else -> MOBILE_USER_AGENT
+        }
+        headers["User-Agent"] = userAgent
+        headers["Accept"] = "*/*"
+
+        when {
+            lowerUrl.contains("tiktok") || lowerUrl.contains("tikwm") || lowerUrl.contains("musical.ly") || lowerUrl.contains("byteoversea") -> {
+                headers["Referer"] = "https://www.tiktok.com/"
+            }
+            lowerUrl.contains("instagram") || lowerUrl.contains("cdninstagram") || lowerUrl.contains("ddinstagram") -> {
+                headers["Referer"] = "https://www.instagram.com/"
+            }
+            lowerUrl.contains("facebook") || lowerUrl.contains("fbcdn") -> {
+                headers["Referer"] = "https://www.facebook.com/"
+            }
+            lowerUrl.contains("oceansaver") || lowerUrl.contains("ddownr") || lowerUrl.contains("savenow") -> {
+                headers["Referer"] = "https://ddownr.com/"
+            }
+            lowerUrl.contains("googlevideo.com") && (lowerUrl.contains("c=web") || lowerUrl.contains("c=mweb") || lowerUrl.contains("c=tvhtml5")) -> {
+                headers["Origin"] = "https://www.youtube.com"
+                headers["Referer"] = "https://www.youtube.com/"
+            }
+        }
+        return headers
+    }
+
+    /**
+     * Probes the first 1 KB of a candidate media stream URL to confirm it responds with HTTP 200/206
+     * and does not return HTTP 403 Forbidden or an HTML error page.
+     */
+    fun isStreamUrlDownloadable(httpClient: OkHttpClient, streamUrl: String): Boolean {
+        val cleanUrl = stripUrlFragment(streamUrl)
+        if (cleanUrl.startsWith("file:", ignoreCase = true)) return true
+        if (!cleanUrl.startsWith("http://", ignoreCase = true) && !cleanUrl.startsWith("https://", ignoreCase = true)) {
+            return false
+        }
+        return try {
+            val reqBuilder = Request.Builder().url(cleanUrl).get()
+            for ((k, v) in buildStreamRequestHeaders(cleanUrl)) {
+                reqBuilder.header(k, v)
+            }
+            reqBuilder.header("Range", "bytes=0-1023")
+            httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                if (resp.code !in 200..299) return false
+                val ct = resp.header("Content-Type")?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+                !ct.startsWith("text/html") && !ct.startsWith("application/xhtml")
+            }
+        } catch (_: Exception) {
+            false
+        }
+    }
+
+    private fun verifyAndFilterYouTubeStreams(
+        httpClient: OkHttpClient,
+        extracted: ExtractedSocialStreams,
+        videoId: String
+    ): ExtractedSocialStreams? {
+        val validVideo = mutableListOf<VideoStreamOption>()
+        val validAudio = mutableListOf<AudioStreamOption>()
+
+        val progressiveVideos = extracted.videoStreams.filter { !it.id.contains("_adap_") }
+        val adaptiveVideos = extracted.videoStreams.filter { it.id.contains("_adap_") }
+
+        // Test one progressive video stream (represents progressive format accessibility for this client)
+        val firstProg = progressiveVideos.firstOrNull()
+        if (firstProg != null && isStreamUrlDownloadable(httpClient, firstProg.downloadUrl)) {
+            validVideo.addAll(
+                progressiveVideos.map { it.copy(downloadUrl = appendVideoIdFragment(it.downloadUrl, videoId)) }
+            )
+        }
+
+        // Test one adaptive video stream separately (some clients allow progressive 18 but 403 on adaptive without PoToken)
+        val firstAdap = adaptiveVideos.firstOrNull()
+        if (firstAdap != null && isStreamUrlDownloadable(httpClient, firstAdap.downloadUrl)) {
+            validVideo.addAll(
+                adaptiveVideos.map { it.copy(downloadUrl = appendVideoIdFragment(it.downloadUrl, videoId)) }
+            )
+        }
+
+        // Test one audio stream
+        val firstAudio = extracted.audioStreams.firstOrNull()
+        if (firstAudio != null && isStreamUrlDownloadable(httpClient, firstAudio.downloadUrl)) {
+            validAudio.addAll(
+                extracted.audioStreams.map { it.copy(downloadUrl = appendVideoIdFragment(it.downloadUrl, videoId)) }
+            )
+        } else if (validVideo.isNotEmpty()) {
+            // If dedicated adaptive audio returned 403, derive audio option from verified progressive MP4 stream
+            val fallbackVideo = validVideo.first()
+            validAudio.add(
+                AudioStreamOption(
+                    id = "yt_verified_demux_audio",
+                    sourceFormat = AudioFormat.M4A,
+                    sourceCodec = "AAC-LC (Demuxed from MP4)",
+                    bitrateKbps = 160,
+                    sampleRateHz = 44100,
+                    channelCount = 2,
+                    isLosslessSource = false,
+                    estimatedSizeBytes = (fallbackVideo.estimatedSizeBytes / 5L).coerceAtLeast(32_768L),
+                    downloadUrl = fallbackVideo.downloadUrl,
+                    isExtractedFromVideo = true
+                )
+            )
+        }
+
+        if (validVideo.isEmpty() && validAudio.isEmpty()) return null
+
+        return extracted.copy(
+            videoStreams = validVideo.sortedByDescending { it.resolutionHeight },
+            audioStreams = validAudio.sortedByDescending { it.bitrateKbps }
+        )
+    }
+
+    private fun appendVideoIdFragment(url: String, videoId: String): String {
+        val clean = stripUrlFragment(url)
+        return if (videoId.isNotBlank()) "$clean#ytid=$videoId" else clean
+    }
 
     private fun fetchYouTubePageContext(httpClient: OkHttpClient, videoId: String): YouTubePageContext {
         var visitorData: String? = null
         var sts: Int? = null
-        var pageStreams: ExtractedSocialStreams? = null
 
-        // 1. Fetch sw.js_data or embed page for visitorData and signatureTimestamp (STS)
+        // 1. Fetch embed page for visitorData and signatureTimestamp (STS)
         runCatching {
             val embedReq = Request.Builder()
                 .url("https://www.youtube.com/embed/$videoId")
@@ -495,7 +629,7 @@ object SocialStreamExtractor {
             }
         }
 
-        // 2. Also inspect mobile watch page for visitorData and any direct ytInitialPlayerResponse streams
+        // 2. Fallback to mobile watch page for visitorData / STS only (never use MWEB raw streams as they 403 without PoToken)
         if (visitorData.isNullOrBlank()) {
             runCatching {
                 val watchReq = Request.Builder()
@@ -513,14 +647,6 @@ object SocialStreamExtractor {
                         if (sts == null) {
                             sts = Regex("\"(?:STS|signatureTimestamp)\"\\s*:\\s*(\\d+)").find(html)?.groupValues?.get(1)?.toIntOrNull()
                         }
-                        val playerJsonStr = extractBalancedJsonAfterMarker(html, "ytInitialPlayerResponse =")
-                            ?: extractBalancedJsonAfterMarker(html, "var ytInitialPlayerResponse =")
-                        if (!playerJsonStr.isNullOrBlank()) {
-                            val playerJson = runCatching { JSONObject(playerJsonStr) }.getOrNull()
-                            if (playerJson != null) {
-                                pageStreams = parseInnerTubePlayerResponse(httpClient, playerJson)
-                            }
-                        }
                     }
                 }
             }
@@ -528,64 +654,26 @@ object SocialStreamExtractor {
 
         return YouTubePageContext(
             visitorData = visitorData,
-            signatureTimestamp = sts,
-            embeddedStreams = pageStreams
+            signatureTimestamp = sts
         )
-    }
-
-    private fun extractBalancedJsonAfterMarker(text: String, marker: String): String? {
-        val idx = text.indexOf(marker)
-        if (idx == -1) return null
-        val braceStart = text.indexOf('{', idx + marker.length)
-        if (braceStart == -1) return null
-        var depth = 0
-        var inString = false
-        var escaped = false
-        for (i in braceStart until minOf(text.length, braceStart + 600_000)) {
-            val ch = text[i]
-            if (escaped) {
-                escaped = false
-                continue
-            }
-            if (ch == '\\') {
-                escaped = true
-                continue
-            }
-            if (ch == '"') {
-                inString = !inString
-                continue
-            }
-            if (!inString) {
-                if (ch == '{') depth++
-                else if (ch == '}') {
-                    depth--
-                    if (depth == 0) {
-                        return text.substring(braceStart, i + 1)
-                    }
-                }
-            }
-        }
-        return null
     }
 
     fun extractYouTubeViaInnerTube(httpClient: OkHttpClient, videoId: String): ExtractedSocialStreams? {
         val pageCtx = fetchYouTubePageContext(httpClient, videoId)
-        pageCtx.embeddedStreams?.let {
-            if (it.videoStreams.isNotEmpty() || it.audioStreams.isNotEmpty()) {
-                return it
-            }
-        }
 
         for (profile in INNERTUBE_CLIENTS) {
-            val result = tryInnerTubeProfile(
+            val rawResult = tryInnerTubeProfile(
                 httpClient = httpClient,
                 videoId = videoId,
                 profile = profile,
                 visitorData = pageCtx.visitorData,
                 signatureTimestamp = pageCtx.signatureTimestamp
             )
-            if (result != null && (result.videoStreams.isNotEmpty() || result.audioStreams.isNotEmpty())) {
-                return result
+            if (rawResult != null) {
+                val verified = verifyAndFilterYouTubeStreams(httpClient, rawResult, videoId)
+                if (verified != null && (verified.videoStreams.isNotEmpty() || verified.audioStreams.isNotEmpty())) {
+                    return verified
+                }
             }
         }
         return null
@@ -661,7 +749,7 @@ object SocialStreamExtractor {
             if (!visitorData.isNullOrBlank()) {
                 reqBuilder.header("X-Goog-Visitor-Id", visitorData)
             }
-            if (profile.isEmbedded || profile.clientName == "MWEB") {
+            if (profile.isEmbedded) {
                 reqBuilder.header("Origin", "https://www.youtube.com")
                 reqBuilder.header("Referer", "https://www.youtube.com/watch?v=$videoId")
             }
@@ -835,7 +923,7 @@ object SocialStreamExtractor {
             )
         }
 
-        // 4. If formats were empty but IOS/ANDROID_VR returned hlsManifestUrl, parse HLS variants
+        // 4. If formats were empty, check hlsManifestUrl
         if (videoStreams.isEmpty()) {
             val hlsManifestUrl = streamingData.optString("hlsManifestUrl").takeIf { it.startsWith("http") }
             if (hlsManifestUrl != null) {
@@ -871,7 +959,6 @@ object SocialStreamExtractor {
         if (direct.startsWith("http://") || direct.startsWith("https://")) {
             return direct
         }
-        // Check signatureCipher / cipher if unencrypted url parameter is present without mandatory 's' cipher
         val cipher = formatItem.optString("signatureCipher").ifBlank { formatItem.optString("cipher") }
         if (cipher.isNotBlank()) {
             val params = cipher.split('&').associate { part ->
@@ -892,18 +979,18 @@ object SocialStreamExtractor {
      * Layer 2 & 3: Public Invidious (with local=true proxy support), Piped, and OceanSaver/Cobalt Resolvers
      */
     fun extractYouTubeViaPipedOrInvidious(httpClient: OkHttpClient, videoId: String): ExtractedSocialStreams? {
-        // Sub-layer A: Invidious API instances (with local=true proxying so streams never 403 on mobile IPs)
+        // Sub-layer A: OceanSaver Direct MP4/M4A CDN Resolver (CDN-signed links do not IP-lock or 403)
+        extractYouTubeViaOceanSaver(httpClient, videoId)?.let {
+            if (it.videoStreams.isNotEmpty() || it.audioStreams.isNotEmpty()) return it
+        }
+
+        // Sub-layer B: Invidious API instances (verified with isStreamUrlDownloadable)
         extractYouTubeViaInvidious(httpClient, videoId)?.let {
             if (it.videoStreams.isNotEmpty() || it.audioStreams.isNotEmpty()) return it
         }
 
-        // Sub-layer B: Piped API instances
+        // Sub-layer C: Piped API instances (verified with isStreamUrlDownloadable)
         extractYouTubeViaPiped(httpClient, videoId)?.let {
-            if (it.videoStreams.isNotEmpty() || it.audioStreams.isNotEmpty()) return it
-        }
-
-        // Sub-layer C: OceanSaver / Loader.to YouTube Direct MP4/M4A Resolver API
-        extractYouTubeViaOceanSaver(httpClient, videoId)?.let {
             if (it.videoStreams.isNotEmpty() || it.audioStreams.isNotEmpty()) return it
         }
 
@@ -945,8 +1032,8 @@ object SocialStreamExtractor {
                         val fObj = formatStreams.optJSONObject(i) ?: continue
                         val rawUrl = fObj.optString("url").takeIf { it.isNotBlank() } ?: continue
                         val itag = fObj.optInt("itag", 18)
-                        // Prefer Invidious proxied latest_version endpoint so mobile IP never gets 403
                         val proxiedUrl = "$baseHost/latest_version?id=$videoId&itag=$itag&local=true"
+                        val candidateUrl = if (rawUrl.startsWith("http")) proxiedUrl else "$baseHost$rawUrl"
                         val resStr = fObj.optString("resolution", "360p")
                         val height = resStr.removeSuffix("p").toIntOrNull() ?: 360
                         val width = (height * 16) / 9
@@ -966,7 +1053,7 @@ object SocialStreamExtractor {
                                 isHdr = false,
                                 bitrateKbps = if (height >= 720) 1800 else 850,
                                 estimatedSizeBytes = if (durationSec > 0) durationSec * (if (height >= 720) 220_000L else 100_000L) else 0L,
-                                downloadUrl = if (rawUrl.startsWith("http")) proxiedUrl else "$baseHost$rawUrl"
+                                downloadUrl = appendVideoIdFragment(candidateUrl, videoId)
                             )
                         )
                     }
@@ -976,7 +1063,7 @@ object SocialStreamExtractor {
                         val aObj = adaptiveFormats.optJSONObject(i) ?: continue
                         val type = aObj.optString("type").lowercase()
                         val itag = aObj.optInt("itag", 140)
-                        val proxiedUrl = "$baseHost/latest_version?id=$videoId&itag=$itag&local=true"
+                        val proxiedUrl = appendVideoIdFragment("$baseHost/latest_version?id=$videoId&itag=$itag&local=true", videoId)
                         val bitrateBps = aObj.optLong("bitrate", 128_000L)
                         val kbps = (bitrateBps / 1000L).toInt().coerceAtLeast(48)
                         val clen = aObj.optLong("clen", if (durationSec > 0) (durationSec * bitrateBps) / 8L else 0L)
@@ -1022,7 +1109,8 @@ object SocialStreamExtractor {
                         }
                     }
 
-                    if (videoStreams.isNotEmpty() || audioStreams.isNotEmpty()) {
+                    val sampleUrl = videoStreams.firstOrNull()?.downloadUrl ?: audioStreams.firstOrNull()?.downloadUrl
+                    if (sampleUrl != null && isStreamUrlDownloadable(httpClient, sampleUrl)) {
                         return ExtractedSocialStreams(title, author, durationSec * 1000L, thumb, videoStreams, audioStreams)
                     }
                 }
@@ -1055,6 +1143,7 @@ object SocialStreamExtractor {
                     val author = root.optString("uploader", "YouTube Creator")
                     val durationSec = root.optLong("duration", 0L)
                     val thumb = root.optString("thumbnailUrl").takeIf { it.isNotBlank() }
+                        ?: "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
 
                     val videoStreams = mutableListOf<VideoStreamOption>()
                     val audioStreams = mutableListOf<AudioStreamOption>()
@@ -1076,7 +1165,7 @@ object SocialStreamExtractor {
                                 channelCount = 2,
                                 isLosslessSource = false,
                                 estimatedSizeBytes = if (durationSec > 0) (durationSec * kbps * 1000L) / 8L else 0L,
-                                downloadUrl = sUrl,
+                                downloadUrl = appendVideoIdFragment(sUrl, videoId),
                                 isExtractedFromVideo = false
                             )
                         )
@@ -1109,12 +1198,13 @@ object SocialStreamExtractor {
                                 isHdr = false,
                                 bitrateKbps = kbps,
                                 estimatedSizeBytes = if (durationSec > 0) (durationSec * kbps * 1000L) / 8L else 0L,
-                                downloadUrl = sUrl
+                                downloadUrl = appendVideoIdFragment(sUrl, videoId)
                             )
                         )
                     }
 
-                    if (videoStreams.isNotEmpty() || audioStreams.isNotEmpty()) {
+                    val sampleUrl = videoStreams.firstOrNull()?.downloadUrl ?: audioStreams.firstOrNull()?.downloadUrl
+                    if (sampleUrl != null && isStreamUrlDownloadable(httpClient, sampleUrl)) {
                         return ExtractedSocialStreams(title, author, durationSec * 1000L, thumb, videoStreams, audioStreams)
                     }
                 }
@@ -1124,10 +1214,14 @@ object SocialStreamExtractor {
         return null
     }
 
-    private fun extractYouTubeViaOceanSaver(httpClient: OkHttpClient, videoId: String): ExtractedSocialStreams? {
+    private fun extractYouTubeViaOceanSaver(
+        httpClient: OkHttpClient,
+        videoId: String,
+        preferredFormat: String = "720"
+    ): ExtractedSocialStreams? {
         return try {
             val ytUrl = URLEncoder.encode("https://www.youtube.com/watch?v=$videoId", "UTF-8")
-            val initUrl = "https://p.oceansaver.in/ajax/download.php?format=720&url=$ytUrl&api=dfcb6d76f2f6a9894gjkege8a4ab232222"
+            val initUrl = "https://p.oceansaver.in/ajax/download.php?format=$preferredFormat&url=$ytUrl&api=dfcb6d76f2f6a9894gjkege8a4ab232222"
             val req = Request.Builder()
                 .url(initUrl)
                 .header("User-Agent", DESKTOP_USER_AGENT)
@@ -1150,11 +1244,12 @@ object SocialStreamExtractor {
 
             val id = taskId ?: return null
             var downloadUrl: String? = null
-            for (attempt in 0 until 8) {
-                Thread.sleep(650)
+            for (attempt in 0 until 10) {
+                Thread.sleep(600)
                 val pollReq = Request.Builder()
                     .url("https://p.oceansaver.in/ajax/progress.php?id=$id")
                     .header("User-Agent", DESKTOP_USER_AGENT)
+                    .header("Referer", "https://ddownr.com/")
                     .get()
                     .build()
                 httpClient.newCall(pollReq).execute().use { pollResp ->
@@ -1169,7 +1264,7 @@ object SocialStreamExtractor {
                 if (downloadUrl != null) break
             }
 
-            val finalStreamUrl = downloadUrl ?: return null
+            val finalStreamUrl = downloadUrl?.let { appendVideoIdFragment(it, videoId) } ?: return null
             val videoStreams = listOf(
                 VideoStreamOption(
                     id = "ocean_720p_hd",
@@ -1205,6 +1300,109 @@ object SocialStreamExtractor {
         } catch (_: Exception) {
             null
         }
+    }
+
+    /**
+     * Automatically resolves a fresh, non-403 stream URL when a previously extracted CDN link
+     * expires or returns HTTP 401/403/410 during download execution.
+     */
+    fun resolveFreshStreamUrlOn403(
+        httpClient: OkHttpClient,
+        failedUrl: String,
+        originPageUrl: String?,
+        thumbnailUrl: String?,
+        isAudio: Boolean,
+        preferredHeight: Int
+    ): String? {
+        val cleanFailed = stripUrlFragment(failedUrl)
+
+        // 1. Check if this is a YouTube video (via #ytid=, originPageUrl, query id=, or i.ytimg.com/vi/<id> thumbnail)
+        val fragmentYtId = failedUrl.substringAfter("#ytid=", "").substringBefore('&').trim().takeIf { it.length == 11 }
+        val originYtId = originPageUrl?.let { extractYouTubeVideoId(it) }
+        val thumbYtId = thumbnailUrl?.let {
+            Regex("ytimg\\.com/vi(?:_webp)?/([a-zA-Z0-9_-]{11})").find(it)?.groupValues?.getOrNull(1)
+        }
+        val queryYtId = Regex("[?&]id=([a-zA-Z0-9_-]{11})(?:&|$)").find(cleanFailed)?.groupValues?.getOrNull(1)
+        val youtubeVideoId = fragmentYtId ?: originYtId ?: thumbYtId ?: queryYtId
+
+        if (!youtubeVideoId.isNullOrBlank()) {
+            // Try InnerTube clients first and pick the first downloadable stream URL that differs from failedUrl
+            val pageCtx = fetchYouTubePageContext(httpClient, youtubeVideoId)
+            for (profile in INNERTUBE_CLIENTS) {
+                val raw = tryInnerTubeProfile(httpClient, youtubeVideoId, profile, pageCtx.visitorData, pageCtx.signatureTimestamp)
+                    ?: continue
+                val candidates = if (isAudio) {
+                    raw.audioStreams.map { it.downloadUrl } + raw.videoStreams.map { it.downloadUrl }
+                } else {
+                    raw.videoStreams.sortedBy { kotlin.math.abs(it.resolutionHeight - preferredHeight.coerceAtLeast(360)) }
+                        .map { it.downloadUrl }
+                }
+                for (candidate in candidates) {
+                    val cleanCandidate = stripUrlFragment(candidate)
+                    if (cleanCandidate != cleanFailed && isStreamUrlDownloadable(httpClient, cleanCandidate)) {
+                        return cleanCandidate
+                    }
+                }
+            }
+
+            // Try OceanSaver Direct CDN Resolver
+            val formatCode = if (isAudio) "m4a" else when {
+                preferredHeight >= 1080 -> "1080"
+                preferredHeight >= 720 -> "720"
+                preferredHeight >= 480 -> "480"
+                else -> "360"
+            }
+            extractYouTubeViaOceanSaver(httpClient, youtubeVideoId, formatCode)?.let { ocean ->
+                val candidate = (if (isAudio) ocean.audioStreams.firstOrNull()?.downloadUrl else ocean.videoStreams.firstOrNull()?.downloadUrl)
+                    ?.let(::stripUrlFragment)
+                if (!candidate.isNullOrBlank() && candidate != cleanFailed && isStreamUrlDownloadable(httpClient, candidate)) {
+                    return candidate
+                }
+            }
+
+            // Try Invidious & Piped fallbacks
+            extractYouTubeViaInvidious(httpClient, youtubeVideoId)?.let { inv ->
+                val candidate = (if (isAudio) inv.audioStreams.firstOrNull()?.downloadUrl else inv.videoStreams.firstOrNull()?.downloadUrl)
+                    ?.let(::stripUrlFragment)
+                if (!candidate.isNullOrBlank() && candidate != cleanFailed && isStreamUrlDownloadable(httpClient, candidate)) {
+                    return candidate
+                }
+            }
+            extractYouTubeViaPiped(httpClient, youtubeVideoId)?.let { piped ->
+                val candidate = (if (isAudio) piped.audioStreams.firstOrNull()?.downloadUrl else piped.videoStreams.firstOrNull()?.downloadUrl)
+                    ?.let(::stripUrlFragment)
+                if (!candidate.isNullOrBlank() && candidate != cleanFailed && isStreamUrlDownloadable(httpClient, candidate)) {
+                    return candidate
+                }
+            }
+        }
+
+        // 2. If originPageUrl is from TikTok, Instagram, or Facebook, re-extract a fresh stream
+        val origin = originPageUrl?.trim().orEmpty()
+        if (origin.isNotBlank()) {
+            val lowerOrigin = origin.lowercase()
+            val refreshed = when {
+                lowerOrigin.contains("tiktok.com") -> extractTikTokStreams(httpClient, origin)
+                lowerOrigin.contains("instagram.com") || lowerOrigin.contains("instagr.am") -> extractInstagramStreams(httpClient, origin)
+                lowerOrigin.contains("facebook.com") || lowerOrigin.contains("fb.watch") || lowerOrigin.contains("fb.com") -> extractFacebookStreams(httpClient, origin)
+                else -> null
+            }
+            if (refreshed != null) {
+                val candidates = if (isAudio) {
+                    refreshed.audioStreams.map { it.downloadUrl } + refreshed.videoStreams.map { it.downloadUrl }
+                } else {
+                    refreshed.videoStreams.map { it.downloadUrl }
+                }
+                for (candidate in candidates) {
+                    val cleanCandidate = stripUrlFragment(candidate)
+                    if (cleanCandidate != cleanFailed && isStreamUrlDownloadable(httpClient, cleanCandidate)) {
+                        return cleanCandidate
+                    }
+                }
+            }
+        }
+
+        return null
     }
 
     // =========================================================================
