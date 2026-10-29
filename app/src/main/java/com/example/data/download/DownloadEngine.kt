@@ -979,10 +979,17 @@ class DownloadEngine(
 
         // HTTP / HTTPS real network stream with Range header support
         val lowerUrl = sourceUrl.lowercase()
-        val userAgent = if (lowerUrl.contains("googlevideo.com")) {
-            "com.google.android.apps.youtube.vr.oculus/1.60.19 (Linux; U; Android 14; en_US; Quest 3; Build/UP1A.231005.007.A1; Cronet/132.0.6808.3)"
-        } else {
-            "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+        val userAgent = when {
+            lowerUrl.contains("googlevideo.com") && lowerUrl.contains("c=ios") ->
+                "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)"
+            lowerUrl.contains("googlevideo.com") && lowerUrl.contains("c=android_vr") ->
+                "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; en_US; eureka-user Build/SQ3A.220605.009.A1) gzip"
+            lowerUrl.contains("googlevideo.com") && lowerUrl.contains("c=android") ->
+                "com.google.android.youtube/20.03.35 (Linux; U; Android 14; en_US) gzip"
+            lowerUrl.contains("googlevideo.com") ->
+                "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
+            else ->
+                "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
         }
         val reqBuilder = Request.Builder()
             .url(sourceUrl)
@@ -995,8 +1002,10 @@ class DownloadEngine(
                 reqBuilder.header("Referer", "https://www.instagram.com/")
             lowerUrl.contains("facebook") || lowerUrl.contains("fbcdn") ->
                 reqBuilder.header("Referer", "https://www.facebook.com/")
-            lowerUrl.contains("youtube") || lowerUrl.contains("googlevideo") ->
+            lowerUrl.contains("googlevideo.com") && (lowerUrl.contains("c=web") || lowerUrl.contains("c=mweb") || lowerUrl.contains("c=tvhtml5")) -> {
                 reqBuilder.header("Origin", "https://www.youtube.com")
+                reqBuilder.header("Referer", "https://www.youtube.com/")
+            }
         }
         if (existingBytes > 0L && supportsResume) {
             reqBuilder.header("Range", "bytes=$existingBytes-")
