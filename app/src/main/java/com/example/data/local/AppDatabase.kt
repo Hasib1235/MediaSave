@@ -83,6 +83,9 @@ interface DownloadTaskDao {
             "(errorMessage LIKE '%403%' OR errorMessage LIKE '%401%' OR errorMessage LIKE '%Access denied%')"
     )
     suspend fun getFailedHttp403Tasks(): List<DownloadTaskEntity>
+
+    @Query("SELECT * FROM download_tasks WHERE status = 'COMPLETED' AND sourceUrl LIKE 'http%'")
+    suspend fun getCompletedRemoteTasks(): List<DownloadTaskEntity>
 }
 
 @Database(entities = [DownloadTaskEntity::class], version = 1, exportSchema = false)

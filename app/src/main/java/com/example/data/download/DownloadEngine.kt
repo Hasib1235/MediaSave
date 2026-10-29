@@ -118,7 +118,50 @@ class DownloadEngine(
                 for (failedTask in legacy403Tasks) {
                     retryDownload(failedTask.id)
                 }
+                val completedRemote = dao.getCompletedRemoteTasks()
+                for (task in completedRemote) {
+                    val outFile = File(task.outputFilePath)
+                    if (task.sourceUrl.contains("#fallback_res=") || isLegacySyntheticFallbackFile(outFile)) {
+                        runCatching { if (outFile.exists()) outFile.delete() }
+                        retryDownload(task.id)
+                    }
+                }
             }
+        }
+    }
+
+    private fun isLegacySyntheticFallbackFile(file: File): Boolean {
+        if (!file.exists() || file.length() !in 40_000L..360_000L) return false
+        return try {
+            RandomAccessFile(file, "r").use { raf ->
+                val headLen = minOf(file.length(), 2048L).toInt()
+                val buf = ByteArray(headLen)
+                raf.readFully(buf)
+                var i = 0
+                while (i + 20 < headLen) {
+                    if (buf[i] == 'm'.code.toByte() &&
+                        buf[i + 1] == 'd'.code.toByte() &&
+                        buf[i + 2] == 'a'.code.toByte() &&
+                        buf[i + 3] == 't'.code.toByte()
+                    ) {
+                        val d = i + 4
+                        if (d + 14 < headLen &&
+                            buf[d + 4] == 0x65.toByte() &&
+                            buf[d + 5] == 0x88.toByte() &&
+                            buf[d + 6] == 0x84.toByte() &&
+                            buf[d + 7] == 0x21.toByte() &&
+                            buf[d + 8] == ((8 * 29 + 7) and 0xFF).toByte() &&
+                            buf[d + 9] == ((9 * 29 + 7) and 0xFF).toByte()
+                        ) {
+                            return true
+                        }
+                    }
+                    i++
+                }
+                false
+            }
+        } catch (_: Exception) {
+            false
         }
     }
 
@@ -1007,15 +1050,24 @@ class DownloadEngine(
             return@withContext
         }
 
-        // Check if this stream was tagged with #fallback_res= during cloud-blocked social analysis
+        // If an older task had #fallback_res= in its URL, resolve the real remote stream URL first
         if (sourceUrl.contains("#fallback_res=")) {
-            val fallbackLocalUri = resolveOnDeviceFallbackUri(
-                taskId = taskId,
-                isAudio = baseByteOffset > 0L
-            )
+            val baseOrigin = SocialStreamExtractor.stripUrlFragment(sourceUrl)
+            val currentTask = dao.getTaskById(taskId)
+            val resolvedRealUrl = SocialStreamExtractor.resolveFreshStreamUrlOn403(
+                httpClient = httpClient,
+                failedUrl = baseOrigin,
+                originPageUrl = taskOriginUrls[taskId] ?: baseOrigin,
+                thumbnailUrl = currentTask?.thumbnailUrl,
+                isAudio = currentTask?.mode == DownloaderMode.MUSIC.name || baseByteOffset > 0L,
+                preferredHeight = currentTask?.height ?: 720
+            ) ?: throw IOException("Could not resolve direct media stream URL for $baseOrigin.")
+            if (currentTask != null && baseByteOffset == 0L) {
+                dao.upsertTask(currentTask.copy(sourceUrl = resolvedRealUrl))
+            }
             transferStreamToFile(
                 taskId = taskId,
-                sourceUrl = fallbackLocalUri,
+                sourceUrl = resolvedRealUrl,
                 targetPartFile = targetPartFile,
                 supportsResume = supportsResume,
                 knownTotalBytes = knownTotalBytes,
@@ -1029,14 +1081,31 @@ class DownloadEngine(
         val cleanUrl = SocialStreamExtractor.stripUrlFragment(sourceUrl)
         val lowerUrl = cleanUrl.lowercase()
         val host = runCatching { URI(cleanUrl).host?.lowercase() }.getOrNull().orEmpty()
+
+        // Fast & reliable 4 MB chunked `&range=start-end` transfer for googlevideo.com streams
+        // Prevents YouTube CDN throttling or mid-stream resets on multi-megabyte videos (e.g. 23 MB+)
+        if (host.contains("googlevideo.com")) {
+            val chunkedSuccess = transferGoogleVideoChunked(
+                taskId = taskId,
+                sourceUrl = sourceUrl,
+                cleanUrl = cleanUrl,
+                targetPartFile = targetPartFile,
+                supportsResume = supportsResume,
+                knownTotalBytes = knownTotalBytes,
+                baseByteOffset = baseByteOffset,
+                recoveryDepth = recoveryDepth
+            )
+            if (chunkedSuccess) {
+                return@withContext
+            }
+        }
+
         val reqBuilder = Request.Builder().url(cleanUrl)
         for ((headerName, headerVal) in SocialStreamExtractor.buildStreamRequestHeaders(cleanUrl)) {
             reqBuilder.header(headerName, headerVal)
         }
         if (existingBytes > 0L && supportsResume) {
             reqBuilder.header("Range", "bytes=$existingBytes-")
-        } else if (host.contains("googlevideo.com") && !lowerUrl.contains("range=")) {
-            reqBuilder.header("Range", "bytes=0-")
         }
 
         val initialResponse = httpClient.newCall(reqBuilder.build()).execute()
@@ -1101,23 +1170,7 @@ class DownloadEngine(
                     return@withContext
                 }
 
-                // Step C: Ultimate Zero-403 Fallback — if all remote CDNs block the cloud IP with 401/403,
-                // seamlessly stream the matching resolution/audio stream from on-device synthesized media
-                val fallbackLocalUri = resolveOnDeviceFallbackUri(
-                    taskId = taskId,
-                    isAudio = currentTask?.mode == DownloaderMode.MUSIC.name || baseByteOffset > 0L
-                )
-                if (targetPartFile.exists()) targetPartFile.delete()
-                transferStreamToFile(
-                    taskId = taskId,
-                    sourceUrl = fallbackLocalUri,
-                    targetPartFile = targetPartFile,
-                    supportsResume = supportsResume,
-                    knownTotalBytes = knownTotalBytes,
-                    baseByteOffset = baseByteOffset,
-                    recoveryDepth = recoveryDepth + 1
-                )
-                return@withContext
+                throw IOException("Access denied or expired media link (HTTP $initialCode). Please re-analyze the source URL.")
             }
         } else {
             initialResponse
@@ -1141,26 +1194,8 @@ class DownloadEngine(
             }
 
             if (!response.isSuccessful) {
-                if (response.code in listOf(401, 403)) {
-                    response.close()
-                    val currentTask = dao.getTaskById(taskId)
-                    val fallbackLocalUri = resolveOnDeviceFallbackUri(
-                        taskId = taskId,
-                        isAudio = currentTask?.mode == DownloaderMode.MUSIC.name || baseByteOffset > 0L
-                    )
-                    if (targetPartFile.exists()) targetPartFile.delete()
-                    transferStreamToFile(
-                        taskId = taskId,
-                        sourceUrl = fallbackLocalUri,
-                        targetPartFile = targetPartFile,
-                        supportsResume = supportsResume,
-                        knownTotalBytes = knownTotalBytes,
-                        baseByteOffset = baseByteOffset,
-                        recoveryDepth = recoveryDepth + 1
-                    )
-                    return@withContext
-                }
                 val message = when (response.code) {
+                    401, 403 -> "Access denied or expired media link (HTTP ${response.code}). Please re-analyze the source URL."
                     404 -> "Media file not found on remote server (HTTP 404)."
                     410 -> "Media link has expired and is no longer available (HTTP 410)."
                     429 -> "Rate limited by remote server (HTTP 429). Please wait and retry."
@@ -1172,27 +1207,6 @@ class DownloadEngine(
 
             val contentType = response.header("Content-Type")?.substringBefore(';')?.trim()?.lowercase().orEmpty()
             if (contentType.startsWith("text/html") || contentType.startsWith("application/xhtml")) {
-                val currentTask = dao.getTaskById(taskId)
-                val isSocialPlatform = currentTask?.platformName != null &&
-                    !currentTask.platformName.contains("Direct", ignoreCase = true)
-                if (isSocialPlatform) {
-                    response.close()
-                    val fallbackLocalUri = resolveOnDeviceFallbackUri(
-                        taskId = taskId,
-                        isAudio = currentTask?.mode == DownloaderMode.MUSIC.name || baseByteOffset > 0L
-                    )
-                    if (targetPartFile.exists()) targetPartFile.delete()
-                    transferStreamToFile(
-                        taskId = taskId,
-                        sourceUrl = fallbackLocalUri,
-                        targetPartFile = targetPartFile,
-                        supportsResume = supportsResume,
-                        knownTotalBytes = knownTotalBytes,
-                        baseByteOffset = baseByteOffset,
-                        recoveryDepth = recoveryDepth + 1
-                    )
-                    return@withContext
-                }
                 targetPartFile.delete()
                 throw IllegalStateException(
                     "Server returned an HTML webpage ($contentType) instead of a downloadable media file."
@@ -1292,26 +1306,179 @@ class DownloadEngine(
         }
     }
 
-    private suspend fun resolveOnDeviceFallbackUri(
+    /**
+     * Downloads a YouTube `googlevideo.com/videoplayback` stream using 4 MB `&range=start-end` query chunks.
+     * This bypasses YouTube's un-ranged stream throttling (~50 KB/s or reset after ~210 KB) and downloads
+     * multi-megabyte videos (e.g. 23 MB - 100+ MB) at full line speed with 100% byte completeness.
+     */
+    private suspend fun transferGoogleVideoChunked(
         taskId: String,
-        isAudio: Boolean
-    ): String {
-        LocalSampleMediaGenerator.ensureAuthorizedSamplesReady(context)
-        val samplesDir = File(context.filesDir, "samples")
-        val currentTask = dao.getTaskById(taskId)
-        val fallbackFile = if (isAudio || currentTask?.mode == DownloaderMode.MUSIC.name) {
-            val m4a = File(samplesDir, "studio_podcast_stereo.m4a")
-            val wav = File(samplesDir, "studio_synth_master_44k.wav")
-            if (m4a.exists() && m4a.length() > 0L) m4a else wav
-        } else {
-            val height = currentTask?.height ?: 720
-            when {
-                height >= 1080 -> File(samplesDir, "cinema_reel_1080p_progressive.mp4")
-                height <= 480 -> File(samplesDir, "cinema_reel_360p.mp4")
-                else -> File(samplesDir, "cinema_reel_720p.mp4")
+        sourceUrl: String,
+        cleanUrl: String,
+        targetPartFile: File,
+        supportsResume: Boolean,
+        knownTotalBytes: Long,
+        baseByteOffset: Long,
+        recoveryDepth: Int
+    ): Boolean {
+        val baseCleanUrl = cleanUrl.replace(Regex("([?&])range=[^&]+"), "$1")
+            .replace("?&", "?")
+            .replace("&&", "&")
+            .trimEnd('?', '&')
+        val clenFromUrl = Regex("[?&]clen=(\\d+)").find(baseCleanUrl)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 0L
+        var totalExpected = clenFromUrl
+        val chunkSize = 4L * 1024L * 1024L // 4 MB per chunk
+        var currentOffset = if (supportsResume && targetPartFile.exists()) targetPartFile.length() else 0L
+        if (totalExpected > 0L && currentOffset > totalExpected) {
+            currentOffset = 0L
+        }
+        val headers = SocialStreamExtractor.buildStreamRequestHeaders(baseCleanUrl)
+
+        RandomAccessFile(targetPartFile, "rw").use { outputRaf ->
+            if (currentOffset == 0L) {
+                outputRaf.setLength(0L)
+            }
+            outputRaf.seek(currentOffset)
+
+            var windowStart = System.currentTimeMillis()
+            var windowBytes = 0L
+            var lastDbUpdate = 0L
+            val buffer = ByteArray(64 * 1024)
+
+            while (totalExpected <= 0L || currentOffset < totalExpected) {
+                val chunkEnd = if (totalExpected > 0L) {
+                    minOf(currentOffset + chunkSize - 1L, totalExpected - 1L)
+                } else {
+                    currentOffset + chunkSize - 1L
+                }
+                val sep = if (baseCleanUrl.contains("?")) "&" else "?"
+                val chunkUrl = "${baseCleanUrl}${sep}range=$currentOffset-$chunkEnd"
+                val reqBuilder = Request.Builder().url(chunkUrl).get()
+                for ((k, v) in headers) {
+                    reqBuilder.header(k, v)
+                }
+
+                val resp = httpClient.newCall(reqBuilder.build()).execute()
+                var chunkBytesRead = 0L
+                val expectedChunkLen = (chunkEnd - currentOffset + 1L).coerceAtLeast(1L)
+
+                resp.use { response ->
+                    if (response.code in listOf(401, 403, 410) && currentOffset == 0L) {
+                        response.close()
+                        val currentTask = dao.getTaskById(taskId)
+                        val queuedFallbacks = taskFallbackUrls[taskId].orEmpty()
+                        val nextQueuedFallback = queuedFallbacks.firstOrNull {
+                            SocialStreamExtractor.stripUrlFragment(it) != cleanUrl
+                        }
+                        if (nextQueuedFallback != null) {
+                            taskFallbackUrls[taskId] = queuedFallbacks.filter { it != nextQueuedFallback }
+                        }
+                        val freshUrl = if (recoveryDepth < 2) {
+                            nextQueuedFallback ?: SocialStreamExtractor.resolveFreshStreamUrlOn403(
+                                httpClient = httpClient,
+                                failedUrl = sourceUrl,
+                                originPageUrl = taskOriginUrls[taskId],
+                                thumbnailUrl = currentTask?.thumbnailUrl,
+                                isAudio = currentTask?.mode == DownloaderMode.MUSIC.name || baseByteOffset > 0L,
+                                preferredHeight = currentTask?.height ?: 720
+                            )
+                        } else null
+
+                        if (!freshUrl.isNullOrBlank() && SocialStreamExtractor.stripUrlFragment(freshUrl) != cleanUrl) {
+                            if (currentTask != null && baseByteOffset == 0L) {
+                                dao.upsertTask(currentTask.copy(sourceUrl = freshUrl))
+                            }
+                            outputRaf.close()
+                            if (targetPartFile.exists()) targetPartFile.delete()
+                            transferStreamToFile(
+                                taskId = taskId,
+                                sourceUrl = freshUrl,
+                                targetPartFile = targetPartFile,
+                                supportsResume = supportsResume,
+                                knownTotalBytes = knownTotalBytes,
+                                baseByteOffset = baseByteOffset,
+                                recoveryDepth = recoveryDepth + 1
+                            )
+                            return true
+                        }
+                        return false
+                    }
+
+                    if (!response.isSuccessful) {
+                        if (currentOffset == 0L) return false
+                        throw IOException("Stream chunk transfer failed at byte $currentOffset (HTTP ${response.code}).")
+                    }
+
+                    val ct = response.header("Content-Type")?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+                    if (ct.startsWith("text/html") || ct.startsWith("application/xhtml")) {
+                        if (currentOffset == 0L) return false
+                        throw IllegalStateException("Server returned HTML instead of binary media chunk.")
+                    }
+
+                    val body = response.body ?: throw IOException("Empty response body for media chunk.")
+                    val contentRangeTotal = response.header("Content-Range")
+                        ?.substringAfterLast('/')
+                        ?.toLongOrNull()
+                    if (totalExpected <= 0L && contentRangeTotal != null && contentRangeTotal > 0L) {
+                        totalExpected = contentRangeTotal
+                    }
+
+                    body.byteStream().use { inputStream ->
+                        while (true) {
+                            val read = inputStream.read(buffer)
+                            if (read == -1) break
+                            outputRaf.write(buffer, 0, read)
+                            currentOffset += read
+                            chunkBytesRead += read
+                            windowBytes += read
+
+                            val now = System.currentTimeMillis()
+                            if (now - lastDbUpdate >= 100L) {
+                                val elapsedMs = (now - windowStart).coerceAtLeast(1L)
+                                val speedBps = (windowBytes * 1000L) / elapsedMs
+                                val currentOverall = baseByteOffset + currentOffset
+                                val overallTotal = when {
+                                    knownTotalBytes > totalExpected -> knownTotalBytes
+                                    totalExpected > 0L -> baseByteOffset + totalExpected
+                                    else -> currentOverall
+                                }
+                                val rem = (overallTotal - currentOverall).coerceAtLeast(0L)
+                                val etaSec = if (speedBps > 0 && overallTotal > 0) rem / speedBps else -1L
+
+                                dao.updateProgress(
+                                    id = taskId,
+                                    downloadedBytes = currentOverall,
+                                    totalBytes = overallTotal.coerceAtLeast(currentOverall),
+                                    speedBytesPerSec = speedBps,
+                                    etaSeconds = etaSec,
+                                    status = DownloadStatus.DOWNLOADING.name,
+                                    statusDetail = "Downloading stream (${formatBytesStatic(currentOverall)} / ${formatBytesStatic(overallTotal)})"
+                                )
+                                lastDbUpdate = now
+                                if (elapsedMs > 1000L) {
+                                    windowStart = now
+                                    windowBytes = 0L
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (chunkBytesRead <= 0L) {
+                    break
+                }
+                if (totalExpected <= 0L && chunkBytesRead < expectedChunkLen) {
+                    break
+                }
             }
         }
-        return fallbackFile.toURI().toString()
+
+        if (totalExpected > 0L && currentOffset < totalExpected) {
+            throw EOFException(
+                "Connection interrupted before completion: received ${formatBytesStatic(currentOffset)} of ${formatBytesStatic(totalExpected)}."
+            )
+        }
+        return currentOffset > 0L
     }
 
     private fun tryAlternativeHeaderProfiles(

@@ -855,21 +855,64 @@ class ExampleRobolectricTest {
         )
         assertEquals(validMp4Payload.size.toLong(), File(finalTask!!.outputFilePath).length())
 
-        // Also verify that even if a remote CDN returns HTTP 403 for EVERY request (e.g. cloud IP block),
-        // DownloadEngine never fails with "Access denied or expired media link (HTTP 403)" and completes cleanly
-        val always403Client = OkHttpClient.Builder()
+        // Verify that when an expired TikTok CDN URL returns HTTP 403, DownloadEngine resolves a fresh stream
+        // via SocialStreamExtractor / TikWM API and downloads 100% of the full video payload (never a 210 KB fallback)
+        val fullVideoPayload = ByteArray(512 * 1024) { ((it * 31 + 7) and 0xFF).toByte() }
+        val freshResolutionClient = OkHttpClient.Builder()
             .addInterceptor { chain ->
-                Response.Builder()
-                    .request(chain.request())
-                    .protocol(Protocol.HTTP_1_1)
-                    .code(403)
-                    .message("Forbidden")
-                    .body("Forbidden".toResponseBody("text/plain".toMediaType()))
-                    .build()
+                val req = chain.request()
+                val url = req.url.toString()
+                when {
+                    url.contains("tikwm.com/api/") -> {
+                        val json = """
+                            {
+                              "code": 0,
+                              "data": {
+                                "id": "734567890",
+                                "title": "Recovered Full Size Video",
+                                "duration": 25,
+                                "hdplay": "https://v16m.tiktokcdn.com/fresh_hd_stream.mp4",
+                                "hd_size": ${fullVideoPayload.size},
+                                "play": "https://v16m.tiktokcdn.com/fresh_sd_stream.mp4",
+                                "size": ${fullVideoPayload.size},
+                                "author": { "nickname": "TikTok Creator" }
+                              }
+                            }
+                        """.trimIndent()
+                        Response.Builder()
+                            .request(req)
+                            .protocol(Protocol.HTTP_1_1)
+                            .code(200)
+                            .message("OK")
+                            .header("Content-Type", "application/json")
+                            .body(json.toResponseBody("application/json".toMediaType()))
+                            .build()
+                    }
+                    url.contains("fresh_hd_stream.mp4") || url.contains("fresh_sd_stream.mp4") -> {
+                        Response.Builder()
+                            .request(req)
+                            .protocol(Protocol.HTTP_1_1)
+                            .code(200)
+                            .message("OK")
+                            .header("Content-Type", "video/mp4")
+                            .header("Content-Length", fullVideoPayload.size.toString())
+                            .body(fullVideoPayload.toResponseBody("video/mp4".toMediaType()))
+                            .build()
+                    }
+                    else -> {
+                        Response.Builder()
+                            .request(req)
+                            .protocol(Protocol.HTTP_1_1)
+                            .code(403)
+                            .message("Forbidden")
+                            .body("Forbidden".toResponseBody("text/plain".toMediaType()))
+                            .build()
+                    }
+                }
             }
             .build()
 
-        // Seed a legacy FAILED task with the old 403 error message to verify startup auto-recovery
+        // Seed a legacy FAILED task with the old 403 error message to verify startup auto-recovery with full bytes
         val legacyFailedFile = File(context.filesDir, "downloads/legacy_403_recovered.mp4")
         dao.upsertTask(
             com.example.domain.model.DownloadTaskEntity(
@@ -886,7 +929,7 @@ class ExampleRobolectricTest {
                 mimeType = "video/mp4",
                 containerFormat = "MP4",
                 codecInfo = "H.264 + AAC",
-                totalBytes = 32_768L,
+                totalBytes = fullVideoPayload.size.toLong(),
                 downloadedBytes = 0L,
                 status = DownloadStatus.FAILED.name,
                 statusDetail = "Download failed",
@@ -894,11 +937,11 @@ class ExampleRobolectricTest {
             )
         )
 
-        val always403Engine = DownloadEngine(
+        val freshRecoveryEngine = DownloadEngine(
             context = context,
             dao = dao,
             externalScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
-            httpClient = always403Client
+            httpClient = freshResolutionClient
         )
 
         var recoveredLegacy = dao.getTaskById("legacy_403_task")
@@ -910,15 +953,15 @@ class ExampleRobolectricTest {
         }
         assertNotNull(recoveredLegacy)
         assertEquals(
-            "Expected legacy 403 failed task to auto-recover and complete, but got: ${recoveredLegacy?.errorMessage}",
+            "Expected legacy 403 failed task to auto-recover with fresh stream and complete, but got: ${recoveredLegacy?.errorMessage}",
             DownloadStatus.COMPLETED,
             recoveredLegacy?.statusEnum
         )
         assertNull(recoveredLegacy?.errorMessage)
         assertTrue(File(recoveredLegacy!!.outputFilePath).exists())
-        assertTrue(File(recoveredLegacy.outputFilePath).length() > 0L)
+        assertEquals(fullVideoPayload.size.toLong(), File(recoveredLegacy.outputFilePath).length())
 
-        always403Engine.deleteTaskAndFile("legacy_403_task")
+        freshRecoveryEngine.deleteTaskAndFile("legacy_403_task")
         db.close()
     }
 }

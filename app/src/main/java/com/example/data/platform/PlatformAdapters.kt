@@ -589,16 +589,11 @@ class YouTubePlatformAdapter(
         }
 
         if (videoStreams.isEmpty() && audioStreams.isEmpty()) {
-            val fallback = SocialStreamExtractor.buildCloudFallbackStreams(
-                sourceUrl = url,
-                title = title,
-                author = author,
-                thumbnailUrl = thumbnailUrl,
-                durationMs = if (durationMs > 0L) durationMs else 30_000L
+            return@withContext MediaAnalysisState.Error(
+                url = url,
+                errorTitle = "Stream Extraction Failed",
+                userMessage = "Could not extract playable video or audio streams for this YouTube link. Please verify the video is public and not age-restricted."
             )
-            videoStreams.addAll(fallback.videoStreams)
-            audioStreams.addAll(fallback.audioStreams)
-            if (durationMs <= 0L) durationMs = fallback.durationMs
         }
 
         MediaAnalysisState.Success(
@@ -631,11 +626,10 @@ class FacebookPlatformAdapter(
     override suspend fun analyze(url: String): MediaAnalysisState = withContext(Dispatchers.IO) {
         val extracted = SocialStreamExtractor.extractFacebookStreams(httpClient, url)
             ?.takeIf { it.videoStreams.isNotEmpty() || it.audioStreams.isNotEmpty() }
-            ?: SocialStreamExtractor.buildCloudFallbackStreams(
-                sourceUrl = url,
-                title = "Facebook Video",
-                author = "Facebook Creator",
-                thumbnailUrl = null
+            ?: return@withContext MediaAnalysisState.Error(
+                url = url,
+                errorTitle = "Facebook Video Unavailable",
+                userMessage = "Could not extract direct MP4 streams from this Facebook link. Ensure the post or Reel is public."
             )
 
         MediaAnalysisState.Success(
@@ -666,11 +660,10 @@ class InstagramPlatformAdapter(
     override suspend fun analyze(url: String): MediaAnalysisState = withContext(Dispatchers.IO) {
         val extracted = SocialStreamExtractor.extractInstagramStreams(httpClient, url)
             ?.takeIf { it.videoStreams.isNotEmpty() || it.audioStreams.isNotEmpty() }
-            ?: SocialStreamExtractor.buildCloudFallbackStreams(
-                sourceUrl = url,
-                title = "Instagram Reel",
-                author = "Instagram Creator",
-                thumbnailUrl = null
+            ?: return@withContext MediaAnalysisState.Error(
+                url = url,
+                errorTitle = "Instagram Reel Unavailable",
+                userMessage = "Could not extract a direct MP4 stream from this Instagram link. Ensure the Reel or post is public."
             )
 
         MediaAnalysisState.Success(
@@ -701,11 +694,10 @@ class TikTokPlatformAdapter(
     override suspend fun analyze(url: String): MediaAnalysisState = withContext(Dispatchers.IO) {
         val extracted = SocialStreamExtractor.extractTikTokStreams(httpClient, url)
             ?.takeIf { it.videoStreams.isNotEmpty() || it.audioStreams.isNotEmpty() }
-            ?: SocialStreamExtractor.buildCloudFallbackStreams(
-                sourceUrl = url,
-                title = "TikTok Video",
-                author = "TikTok Creator",
-                thumbnailUrl = null
+            ?: return@withContext MediaAnalysisState.Error(
+                url = url,
+                errorTitle = "TikTok Video Unavailable",
+                userMessage = "Could not extract direct MP4/MP3 streams from this TikTok link. Please verify the link is valid and public."
             )
 
         MediaAnalysisState.Success(
