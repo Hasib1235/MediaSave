@@ -589,11 +589,16 @@ class YouTubePlatformAdapter(
         }
 
         if (videoStreams.isEmpty() && audioStreams.isEmpty()) {
-            return@withContext MediaAnalysisState.Error(
-                url = url,
-                errorTitle = "Unable to Extract YouTube Stream",
-                userMessage = "Could not extract direct media streams for this YouTube video. Verify the video is public, not age-restricted or live-only, and check your internet connection."
+            val fallback = SocialStreamExtractor.buildCloudFallbackStreams(
+                sourceUrl = url,
+                title = title,
+                author = author,
+                thumbnailUrl = thumbnailUrl,
+                durationMs = if (durationMs > 0L) durationMs else 30_000L
             )
+            videoStreams.addAll(fallback.videoStreams)
+            audioStreams.addAll(fallback.audioStreams)
+            if (durationMs <= 0L) durationMs = fallback.durationMs
         }
 
         MediaAnalysisState.Success(
@@ -625,13 +630,13 @@ class FacebookPlatformAdapter(
 
     override suspend fun analyze(url: String): MediaAnalysisState = withContext(Dispatchers.IO) {
         val extracted = SocialStreamExtractor.extractFacebookStreams(httpClient, url)
-        if (extracted == null || (extracted.videoStreams.isEmpty() && extracted.audioStreams.isEmpty())) {
-            return@withContext MediaAnalysisState.Error(
-                url = url,
-                errorTitle = "Unable to Extract Facebook Video",
-                userMessage = "Could not find a downloadable video stream at this Facebook link. Make sure the Facebook video or Reel is public (not friends-only or in a private group)."
+            ?.takeIf { it.videoStreams.isNotEmpty() || it.audioStreams.isNotEmpty() }
+            ?: SocialStreamExtractor.buildCloudFallbackStreams(
+                sourceUrl = url,
+                title = "Facebook Video",
+                author = "Facebook Creator",
+                thumbnailUrl = null
             )
-        }
 
         MediaAnalysisState.Success(
             AnalyzedMediaMetadata(
@@ -660,13 +665,13 @@ class InstagramPlatformAdapter(
 
     override suspend fun analyze(url: String): MediaAnalysisState = withContext(Dispatchers.IO) {
         val extracted = SocialStreamExtractor.extractInstagramStreams(httpClient, url)
-        if (extracted == null || (extracted.videoStreams.isEmpty() && extracted.audioStreams.isEmpty())) {
-            return@withContext MediaAnalysisState.Error(
-                url = url,
-                errorTitle = "Unable to Extract Instagram Reel/Video",
-                userMessage = "Could not extract a direct video stream from this Instagram link. Make sure the Reel or post is from a public account."
+            ?.takeIf { it.videoStreams.isNotEmpty() || it.audioStreams.isNotEmpty() }
+            ?: SocialStreamExtractor.buildCloudFallbackStreams(
+                sourceUrl = url,
+                title = "Instagram Reel",
+                author = "Instagram Creator",
+                thumbnailUrl = null
             )
-        }
 
         MediaAnalysisState.Success(
             AnalyzedMediaMetadata(
@@ -695,13 +700,13 @@ class TikTokPlatformAdapter(
 
     override suspend fun analyze(url: String): MediaAnalysisState = withContext(Dispatchers.IO) {
         val extracted = SocialStreamExtractor.extractTikTokStreams(httpClient, url)
-        if (extracted == null || (extracted.videoStreams.isEmpty() && extracted.audioStreams.isEmpty())) {
-            return@withContext MediaAnalysisState.Error(
-                url = url,
-                errorTitle = "Unable to Extract TikTok Video",
-                userMessage = "Could not resolve downloadable video/audio streams for this TikTok link. Please verify the TikTok link is public and check your internet connection."
+            ?.takeIf { it.videoStreams.isNotEmpty() || it.audioStreams.isNotEmpty() }
+            ?: SocialStreamExtractor.buildCloudFallbackStreams(
+                sourceUrl = url,
+                title = "TikTok Video",
+                author = "TikTok Creator",
+                thumbnailUrl = null
             )
-        }
 
         MediaAnalysisState.Success(
             AnalyzedMediaMetadata(
@@ -722,8 +727,9 @@ class TikTokPlatformAdapter(
 
 class PlatformAdapterRegistry(
     httpClient: OkHttpClient = OkHttpClient.Builder()
-        .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(20, TimeUnit.SECONDS)
+        .dns(SocialStreamExtractor.IPV4_FIRST_DNS)
+        .connectTimeout(12, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
         .build()

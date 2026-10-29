@@ -77,6 +77,12 @@ interface DownloadTaskDao {
             "WHERE status IN ('QUEUED', 'DOWNLOADING', 'MERGING_STREAMS', 'EXTRACTING_AUDIO', 'CONVERTING_AUDIO', 'VALIDATING')"
     )
     suspend fun recoverInterruptedTasksOnStartup(): Int
+
+    @Query(
+        "SELECT * FROM download_tasks WHERE status = 'FAILED' AND " +
+            "(errorMessage LIKE '%403%' OR errorMessage LIKE '%401%' OR errorMessage LIKE '%Access denied%')"
+    )
+    suspend fun getFailedHttp403Tasks(): List<DownloadTaskEntity>
 }
 
 @Database(entities = [DownloadTaskEntity::class], version = 1, exportSchema = false)

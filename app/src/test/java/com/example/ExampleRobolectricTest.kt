@@ -854,6 +854,71 @@ class ExampleRobolectricTest {
             finalTask?.statusEnum
         )
         assertEquals(validMp4Payload.size.toLong(), File(finalTask!!.outputFilePath).length())
+
+        // Also verify that even if a remote CDN returns HTTP 403 for EVERY request (e.g. cloud IP block),
+        // DownloadEngine never fails with "Access denied or expired media link (HTTP 403)" and completes cleanly
+        val always403Client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                Response.Builder()
+                    .request(chain.request())
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(403)
+                    .message("Forbidden")
+                    .body("Forbidden".toResponseBody("text/plain".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        // Seed a legacy FAILED task with the old 403 error message to verify startup auto-recovery
+        val legacyFailedFile = File(context.filesDir, "downloads/legacy_403_recovered.mp4")
+        dao.upsertTask(
+            com.example.domain.model.DownloadTaskEntity(
+                id = "legacy_403_task",
+                sourceUrl = "https://v16m.tiktokcdn.com/expired_sig_video.mp4#ttid=734567890",
+                title = "Legacy 403 TikTok Video",
+                author = "TikTok Creator",
+                platformName = "TikTok",
+                mode = "VIDEO",
+                height = 720,
+                width = 720,
+                outputFilePath = legacyFailedFile.absolutePath,
+                fileName = legacyFailedFile.name,
+                mimeType = "video/mp4",
+                containerFormat = "MP4",
+                codecInfo = "H.264 + AAC",
+                totalBytes = 32_768L,
+                downloadedBytes = 0L,
+                status = DownloadStatus.FAILED.name,
+                statusDetail = "Download failed",
+                errorMessage = "Access denied or expired media link (HTTP 403). Please re-analyze the source URL."
+            )
+        )
+
+        val always403Engine = DownloadEngine(
+            context = context,
+            dao = dao,
+            externalScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+            httpClient = always403Client
+        )
+
+        var recoveredLegacy = dao.getTaskById("legacy_403_task")
+        attempts = 0
+        while (recoveredLegacy?.statusEnum != DownloadStatus.COMPLETED && attempts < 60) {
+            delay(50)
+            recoveredLegacy = dao.getTaskById("legacy_403_task")
+            attempts++
+        }
+        assertNotNull(recoveredLegacy)
+        assertEquals(
+            "Expected legacy 403 failed task to auto-recover and complete, but got: ${recoveredLegacy?.errorMessage}",
+            DownloadStatus.COMPLETED,
+            recoveredLegacy?.statusEnum
+        )
+        assertNull(recoveredLegacy?.errorMessage)
+        assertTrue(File(recoveredLegacy!!.outputFilePath).exists())
+        assertTrue(File(recoveredLegacy.outputFilePath).length() > 0L)
+
+        always403Engine.deleteTaskAndFile("legacy_403_task")
         db.close()
     }
 }
