@@ -254,6 +254,70 @@ object UrlValidator {
     }
 
     /**
+     * Extracts the first valid HTTP/HTTPS/file URL from a shared text payload (e.g., TikTok, YouTube,
+     * Instagram, or Facebook share captions like "Check out this video! https://vt.tiktok.com/ZSgs61xSd/"),
+     * stripping trailing sentence punctuation while preserving valid URL characters.
+     */
+    fun extractFirstUrlFromText(rawText: String?): String? {
+        val trimmed = rawText?.trim().orEmpty()
+        if (trimmed.isEmpty()) return null
+        val urlRegex = Regex("(https?://[^\\s\"<>]+|file://[^\\s\"<>]+)", RegexOption.IGNORE_CASE)
+        val matched = urlRegex.find(trimmed)?.value?.trim()
+            ?.trimEnd('.', ',', ';', ')', ']', '>', '\'', '"', '!')
+        return matched?.takeIf { it.isNotBlank() } ?: trimmed
+    }
+
+    /**
+     * Extracts a shared media URL from an incoming Android Share Intent (ACTION_SEND, ACTION_VIEW,
+     * EXTRA_TEXT, EXTRA_PROCESS_TEXT, or ClipData) sent from YouTube, TikTok, Instagram, Facebook, or browsers.
+     */
+    fun extractSharedUrlFromIntent(intent: Intent?): String? {
+        if (intent == null) return null
+        val action = intent.action ?: return null
+
+        if (action == Intent.ACTION_VIEW) {
+            val dataUrl = intent.dataString?.trim()
+            if (!dataUrl.isNullOrBlank()) {
+                return extractFirstUrlFromText(dataUrl)
+            }
+        }
+
+        if (action == Intent.ACTION_SEND || action == Intent.ACTION_SEND_MULTIPLE || action == Intent.ACTION_PROCESS_TEXT) {
+            val extraText = intent.getCharSequenceExtra(Intent.EXTRA_TEXT)?.toString()?.trim()
+            if (!extraText.isNullOrBlank()) {
+                return extractFirstUrlFromText(extraText)
+            }
+
+            val processText = intent.getCharSequenceExtra(Intent.EXTRA_PROCESS_TEXT)?.toString()?.trim()
+            if (!processText.isNullOrBlank()) {
+                return extractFirstUrlFromText(processText)
+            }
+
+            val subjectText = intent.getCharSequenceExtra(Intent.EXTRA_SUBJECT)?.toString()?.trim()
+            if (!subjectText.isNullOrBlank() && (subjectText.contains("http://", ignoreCase = true) || subjectText.contains("https://", ignoreCase = true))) {
+                return extractFirstUrlFromText(subjectText)
+            }
+
+            val clip = intent.clipData
+            if (clip != null && clip.itemCount > 0) {
+                for (i in 0 until clip.itemCount) {
+                    val item = clip.getItemAt(i) ?: continue
+                    val itemText = item.text?.toString()?.trim()
+                    if (!itemText.isNullOrBlank()) {
+                        return extractFirstUrlFromText(itemText)
+                    }
+                    val itemUri = item.uri?.toString()?.trim()
+                    if (!itemUri.isNullOrBlank()) {
+                        return extractFirstUrlFromText(itemUri)
+                    }
+                }
+            }
+        }
+
+        return null
+    }
+
+    /**
      * Parses raw text from the clipboard, extracting an embedded URL if the user copied share text
      * (e.g., "Watch this video: https://...") and validating the result.
      */
@@ -263,13 +327,7 @@ object UrlValidator {
             return ClipboardParseResult.Empty
         }
 
-        // If the clipboard contains surrounding share text with a single http/https/file URL, extract the URL
-        val candidate = if (trimmed.contains(" ") || trimmed.contains("\n")) {
-            val urlRegex = Regex("(https?://[^\\s\"<>]+|file://[^\\s\"<>]+)", RegexOption.IGNORE_CASE)
-            urlRegex.find(trimmed)?.value?.trim() ?: trimmed
-        } else {
-            trimmed
-        }
+        val candidate = extractFirstUrlFromText(trimmed) ?: trimmed
 
         return when (val result = validateAndClassify(candidate)) {
             is UrlValidationResult.Valid -> ClipboardParseResult.ValidUrl(

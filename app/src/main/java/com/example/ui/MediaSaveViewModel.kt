@@ -27,6 +27,8 @@ import com.example.domain.model.VideoStreamOption
 import com.example.domain.validation.ClipboardParseResult
 import com.example.domain.validation.SocialPlatformLaunchResult
 import com.example.domain.validation.UrlValidator
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -37,6 +39,7 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.File
 
 data class AudioPlayerState(
@@ -63,7 +66,11 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
     private val dao = database.downloadTaskDao()
     private val preferencesRepository = UserPreferencesRepository(application)
     private val adapterRegistry = PlatformAdapterRegistry()
-    val downloadEngine = DownloadEngine(application, dao, viewModelScope)
+    val downloadEngine = DownloadEngine(
+        application,
+        dao,
+        CoroutineScope(viewModelScope.coroutineContext + Dispatchers.IO)
+    )
 
     val userSettings: StateFlow<UserSettings> = preferencesRepository.settingsFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), UserSettings())
@@ -100,6 +107,10 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
     private val _showActiveDownloadingScreen = MutableStateFlow(false)
     val showActiveDownloadingScreen: StateFlow<Boolean> = _showActiveDownloadingScreen.asStateFlow()
 
+    // Direct Android Share Intent flow state (bypasses Splash & Home screen directly to Download Options)
+    private val _isShareIntentFlow = MutableStateFlow(false)
+    val isShareIntentFlow: StateFlow<Boolean> = _isShareIntentFlow.asStateFlow()
+
     private val _duplicatePrompt = MutableStateFlow<DuplicateDownloadPrompt?>(null)
     val duplicatePrompt: StateFlow<DuplicateDownloadPrompt?> = _duplicatePrompt.asStateFlow()
 
@@ -123,11 +134,11 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
     val storageSummary: StateFlow<DeviceStorageSummary> = allTasks
-        .map { downloadEngine.computeStorageSummary() }
+        .map { withContext(Dispatchers.IO) { downloadEngine.computeStorageSummary() } }
         .stateIn(
             viewModelScope,
             SharingStarted.WhileSubscribed(5000),
-            downloadEngine.computeStorageSummary()
+            DeviceStorageSummary()
         )
 
     val sortedVideos: StateFlow<List<DownloadTaskEntity>> = combine(
@@ -180,7 +191,9 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
 
     init {
         viewModelScope.launch {
-            val samples = LocalSampleMediaGenerator.ensureAuthorizedSamplesReady(getApplication())
+            val samples = withContext(Dispatchers.IO) {
+                LocalSampleMediaGenerator.ensureAuthorizedSamplesReady(getApplication())
+            }
             _authorizedSamples.value = samples
         }
         viewModelScope.launch {
@@ -282,7 +295,40 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
         return result
     }
 
-    fun analyzeCurrentUrl() {
+    /**
+     * Handles an incoming Android Share Intent (ACTION_SEND or ACTION_VIEW) from YouTube, TikTok,
+     * Instagram, Facebook, or browsers. Automatically extracts the shared URL, bypasses the Splash
+     * and Home screens, and immediately analyzes the link to show Download Options directly.
+     */
+    fun handleIncomingShareIntent(intent: Intent?): Boolean {
+        val extractedUrl = UrlValidator.extractSharedUrlFromIntent(intent) ?: return false
+        if (extractedUrl.isBlank()) return false
+        handleSharedUrlDirect(extractedUrl)
+        return true
+    }
+
+    /**
+     * Directly processes a shared URL or share caption without going through the Home screen.
+     */
+    fun handleSharedUrlDirect(rawSharedInput: String) {
+        val cleanUrl = UrlValidator.extractFirstUrlFromText(rawSharedInput)?.trim().orEmpty()
+        if (cleanUrl.isEmpty()) return
+        _isShareIntentFlow.value = true
+        _showActiveDownloadingScreen.value = false
+        _urlInput.value = cleanUrl
+        analyzeCurrentUrl(isFromShareIntent = true)
+    }
+
+    fun dismissShareIntentFlow() {
+        _isShareIntentFlow.value = false
+        _showStreamSelectionSheet.value = false
+        if (_analysisState.value is MediaAnalysisState.Analyzing) {
+            analysisJob?.cancel()
+            _analysisState.value = MediaAnalysisState.Idle
+        }
+    }
+
+    fun analyzeCurrentUrl(isFromShareIntent: Boolean = false) {
         val rawUrl = _urlInput.value.trim()
         analysisJob?.cancel()
 
@@ -296,13 +342,32 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
             return
         }
 
+        if (isFromShareIntent) {
+            _isShareIntentFlow.value = true
+        }
+
+        val platformLabel = when (val v = UrlValidator.validateAndClassify(rawUrl)) {
+            is com.example.domain.validation.UrlValidationResult.Valid -> v.platform.displayName
+            else -> "Shared Media"
+        }
+
+        // Set Analyzing state synchronously before launching coroutine so the first frame skips Home screen
+        _analysisState.value = MediaAnalysisState.Analyzing(
+            url = rawUrl,
+            stageMessage = if (isFromShareIntent) {
+                "Shared from $platformLabel • Extracting direct download options..."
+            } else {
+                "Inspecting media container, tracks, and codecs..."
+            }
+        )
+
         analysisJob = viewModelScope.launch {
-            _analysisState.value = MediaAnalysisState.Analyzing(
-                url = rawUrl,
-                stageMessage = "Inspecting media container, tracks, and codecs..."
-            )
-            delay(400)
-            val result = adapterRegistry.validateAndAnalyze(rawUrl)
+            if (!isFromShareIntent) {
+                delay(400)
+            }
+            val result = withContext(Dispatchers.IO) {
+                adapterRegistry.validateAndAnalyze(rawUrl)
+            }
             _analysisState.value = result
 
             if (result is MediaAnalysisState.Success) {
@@ -316,6 +381,8 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
 
                 if (meta.videoStreams.isEmpty() && meta.audioStreams.isNotEmpty()) {
                     _selectedMode.value = DownloaderMode.MUSIC
+                } else if (isFromShareIntent && meta.videoStreams.isNotEmpty()) {
+                    _selectedMode.value = DownloaderMode.VIDEO
                 }
                 _showStreamSelectionSheet.value = true
             }
@@ -324,6 +391,7 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun cancelAnalyzing() {
         analysisJob?.cancel()
+        _isShareIntentFlow.value = false
         _analysisState.value = MediaAnalysisState.Idle
         _showStreamSelectionSheet.value = false
     }
@@ -350,6 +418,7 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
 
     fun dismissStreamSelectionSheet() {
         _showStreamSelectionSheet.value = false
+        _isShareIntentFlow.value = false
     }
 
     fun openStreamSelectionSheet() {
@@ -416,6 +485,7 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
     ) {
         when (result) {
             is EnqueueResult.Enqueued -> {
+                _isShareIntentFlow.value = false
                 _showStreamSelectionSheet.value = false
                 _duplicatePrompt.value = null
                 _showActiveDownloadingScreen.value = true
@@ -474,7 +544,7 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             val ok = downloadEngine.renameMediaFile(taskId, newTitle)
             if (ok && _audioPlayerState.value.activeTrack?.id == taskId) {
-                val updated = dao.getTaskById(taskId)
+                val updated = withContext(Dispatchers.IO) { dao.getTaskById(taskId) }
                 if (updated != null) {
                     _audioPlayerState.value = _audioPlayerState.value.copy(activeTrack = updated)
                 }

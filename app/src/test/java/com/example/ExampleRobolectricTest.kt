@@ -583,5 +583,169 @@ class ExampleRobolectricTest {
         org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
         assertTrue(viewModel.snackbarMessage.value.orEmpty().contains("MediaStore"))
     }
-}
 
+    @Test
+    fun `http stream download executes on background IO thread and never throws NetworkOnMainThreadException`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val dao = db.downloadTaskDao()
+
+        val strictMainThreadGuardClient = okhttp3.OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+                    throw android.os.NetworkOnMainThreadException()
+                }
+                val mp4Bytes = ByteArray(4096) { (it % 251).toByte() }
+                okhttp3.Response.Builder()
+                    .request(chain.request())
+                    .protocol(okhttp3.Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .header("Content-Type", "video/mp4")
+                    .header("Content-Length", mp4Bytes.size.toString())
+                    .body(mp4Bytes.toResponseBody("video/mp4".toMediaType()))
+                    .build()
+            }
+            .build()
+
+        // Even when given a Main-thread-bound scope, DownloadEngine must dispatch network I/O to Dispatchers.IO
+        val mainBoundScope = kotlinx.coroutines.CoroutineScope(
+            kotlinx.coroutines.SupervisorJob() + kotlinx.coroutines.Dispatchers.Main
+        )
+        val engine = DownloadEngine(
+            context = context,
+            dao = dao,
+            externalScope = mainBoundScope,
+            httpClient = strictMainThreadGuardClient
+        )
+
+        val streamOption = com.example.domain.model.VideoStreamOption(
+            id = "yt_720p",
+            resolutionLabel = "720p HD",
+            resolutionWidth = 1280,
+            resolutionHeight = 720,
+            frameRate = 30,
+            isHdr = false,
+            container = com.example.domain.model.VideoContainerFormat.MP4,
+            videoCodec = "H.264",
+            audioCodec = "AAC",
+            streamType = com.example.domain.model.StreamType.PROGRESSIVE,
+            bitrateKbps = 1500,
+            estimatedSizeBytes = 4096L,
+            downloadUrl = "https://rr1---sn-test.googlevideo.com/videoplayback?itag=18&c=ANDROID_VR"
+        )
+        val metadata = com.example.domain.model.AnalyzedMediaMetadata(
+            sourceUrl = "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            title = "Test YouTube Video",
+            authorOrDomain = "YouTube Creator",
+            platform = com.example.domain.model.MediaPlatform.YOUTUBE,
+            durationMs = 15_000L,
+            thumbnailUrl = null,
+            supportsRangeRequests = true,
+            videoStreams = listOf(streamOption),
+            audioStreams = emptyList(),
+            inspectionMethod = "YouTube Stream Extractor"
+        )
+
+        val enqueueResult = engine.enqueueVideoDownload(metadata, streamOption)
+        assertTrue(enqueueResult is EnqueueResult.Enqueued)
+        val taskId = (enqueueResult as EnqueueResult.Enqueued).task.id
+
+        var finalTask = dao.getTaskById(taskId)
+        val deadline = System.currentTimeMillis() + 6000L
+        while (System.currentTimeMillis() < deadline) {
+            org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            finalTask = dao.getTaskById(taskId)
+            if (finalTask?.statusEnum == DownloadStatus.COMPLETED || finalTask?.statusEnum == DownloadStatus.FAILED) {
+                break
+            }
+            kotlinx.coroutines.delay(50)
+        }
+
+        assertNotNull(finalTask)
+        assertEquals(
+            "Expected COMPLETED but failed with: ${finalTask?.errorMessage}",
+            DownloadStatus.COMPLETED,
+            finalTask?.statusEnum
+        )
+        db.close()
+    }
+
+    @Test
+    fun `android share intent integration extracts social urls and opens download options directly`() = runBlocking {
+        val app = ApplicationProvider.getApplicationContext<Application>()
+
+        // 1. Verify UrlValidator.extractSharedUrlFromIntent extracts clean URLs from YouTube, TikTok, Instagram & Facebook share captions
+        val tiktokShareIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(android.content.Intent.EXTRA_TEXT, "Check out Creator's video! #TikTok https://vt.tiktok.com/ZSgs61xSd/!")
+        }
+        assertEquals("https://vt.tiktok.com/ZSgs61xSd/", UrlValidator.extractSharedUrlFromIntent(tiktokShareIntent))
+
+        val youtubeShareIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(android.content.Intent.EXTRA_TEXT, "Watch this awesome clip on YouTube: https://youtu.be/dQw4w9WgXcQ?si=xyz123.")
+        }
+        assertEquals("https://youtu.be/dQw4w9WgXcQ?si=xyz123", UrlValidator.extractSharedUrlFromIntent(youtubeShareIntent))
+
+        val instagramShareIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(android.content.Intent.EXTRA_TEXT, "https://www.instagram.com/reel/C8xYz123AbC/?igsh=abc")
+        }
+        assertEquals("https://www.instagram.com/reel/C8xYz123AbC/?igsh=abc", UrlValidator.extractSharedUrlFromIntent(instagramShareIntent))
+
+        val facebookViewIntent = android.content.Intent(
+            android.content.Intent.ACTION_VIEW,
+            android.net.Uri.parse("https://fb.watch/rT9xYz123/")
+        )
+        assertEquals("https://fb.watch/rT9xYz123/", UrlValidator.extractSharedUrlFromIntent(facebookViewIntent))
+
+        // 2. Verify MediaSaveViewModel.handleIncomingShareIntent sets isShareIntentFlow = true, bypasses Home screen,
+        //    analyzes the shared media immediately, opens StreamSelectionBottomSheet, and starts the download
+        val samples = LocalSampleMediaGenerator.ensureAuthorizedSamplesReady(app)
+        val multiVideoSample = samples.first { it.id == "sample_multi_video" }
+
+        val viewModel = MediaSaveViewModel(app)
+        val mediaShareIntent = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(android.content.Intent.EXTRA_TEXT, "Shared MediaSave Stream: ${multiVideoSample.uri}")
+        }
+
+        val handled = viewModel.handleIncomingShareIntent(mediaShareIntent)
+        assertTrue(handled)
+        assertTrue(viewModel.isShareIntentFlow.value)
+        assertEquals(multiVideoSample.uri, viewModel.urlInput.value)
+
+        // Wait for background IO analysis to complete
+        val deadline = System.currentTimeMillis() + 5000L
+        while (System.currentTimeMillis() < deadline) {
+            org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            if (viewModel.analysisState.value is MediaAnalysisState.Success) {
+                break
+            }
+            delay(50)
+        }
+
+        assertTrue(viewModel.analysisState.value is MediaAnalysisState.Success)
+        assertTrue("Stream selection sheet must open directly on Share Intent", viewModel.showStreamSelectionSheet.value)
+        assertNotNull(viewModel.selectedVideoStream.value)
+
+        // Start download directly from the Share Intent options sheet
+        var navigatedToQueue = false
+        viewModel.startSelectedDownload(
+            forceAllowDuplicate = true,
+            onNavigateToQueue = { navigatedToQueue = true }
+        )
+
+        val dlDeadline = System.currentTimeMillis() + 5000L
+        while (System.currentTimeMillis() < dlDeadline && !navigatedToQueue) {
+            org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            delay(50)
+        }
+
+        assertTrue("Starting download from Share Intent must navigate to active download screen", navigatedToQueue)
+        assertTrue(viewModel.showActiveDownloadingScreen.value)
+    }
+}

@@ -102,7 +102,7 @@ class DownloadEngine(
 
     init {
         createNotificationChannel()
-        externalScope.launch {
+        externalScope.launch(Dispatchers.IO) {
             runCatching {
                 val recovered = dao.recoverInterruptedTasksOnStartup()
                 if (recovered > 0) {
@@ -304,7 +304,7 @@ class DownloadEngine(
 
     fun pauseDownload(taskId: String) {
         activeJobs.remove(taskId)?.cancel()
-        externalScope.launch {
+        externalScope.launch(Dispatchers.IO) {
             val current = dao.getTaskById(taskId) ?: return@launch
             if (current.statusEnum.isActive) {
                 dao.upsertTask(
@@ -320,7 +320,7 @@ class DownloadEngine(
     }
 
     fun resumeDownload(taskId: String) {
-        externalScope.launch {
+        externalScope.launch(Dispatchers.IO) {
             val current = dao.getTaskById(taskId) ?: return@launch
             if (current.statusEnum == DownloadStatus.PAUSED || current.statusEnum == DownloadStatus.FAILED) {
                 dao.upsertTask(
@@ -336,7 +336,7 @@ class DownloadEngine(
     }
 
     fun retryDownload(taskId: String) {
-        externalScope.launch {
+        externalScope.launch(Dispatchers.IO) {
             val current = dao.getTaskById(taskId) ?: return@launch
             val partFile = File("${current.outputFilePath}.part")
             if (partFile.exists()) partFile.delete()
@@ -356,7 +356,7 @@ class DownloadEngine(
 
     fun cancelDownload(taskId: String) {
         activeJobs.remove(taskId)?.cancel()
-        externalScope.launch {
+        externalScope.launch(Dispatchers.IO) {
             val current = dao.getTaskById(taskId) ?: return@launch
             File("${current.outputFilePath}.part").delete()
             File("${current.outputFilePath}.audio.part").delete()
@@ -407,7 +407,7 @@ class DownloadEngine(
 
     private fun startTaskExecution(taskId: String) {
         if (activeJobs.containsKey(taskId)) return
-        val job = externalScope.launch {
+        val job = externalScope.launch(Dispatchers.IO) {
             concurrencySemaphore.withPermit {
                 executeDownloadPipeline(taskId)
             }
@@ -416,8 +416,8 @@ class DownloadEngine(
         job.invokeOnCompletion { activeJobs.remove(taskId) }
     }
 
-    private suspend fun executeDownloadPipeline(taskId: String) {
-        val initialTask = dao.getTaskById(taskId) ?: return
+    private suspend fun executeDownloadPipeline(taskId: String) = withContext(Dispatchers.IO) {
+        val initialTask = dao.getTaskById(taskId) ?: return@withContext
         val finalFile = File(initialTask.outputFilePath)
         val primaryPartFile = File("${initialTask.outputFilePath}.part")
         val secondaryAudioPartFile = File("${initialTask.outputFilePath}.audio.part")
@@ -905,7 +905,7 @@ class DownloadEngine(
         supportsResume: Boolean,
         knownTotalBytes: Long,
         baseByteOffset: Long
-    ) {
+    ): Unit = withContext(Dispatchers.IO) {
         targetPartFile.parentFile?.mkdirs()
         var existingBytes = if (supportsResume && targetPartFile.exists()) targetPartFile.length() else 0L
 
@@ -974,7 +974,7 @@ class DownloadEngine(
                     }
                 }
             }
-            return
+            return@withContext
         }
 
         // HTTP / HTTPS real network stream with Range header support
@@ -1024,7 +1024,7 @@ class DownloadEngine(
                     knownTotalBytes = knownTotalBytes,
                     baseByteOffset = baseByteOffset
                 )
-                return
+                return@withContext
             }
 
             if (!response.isSuccessful) {

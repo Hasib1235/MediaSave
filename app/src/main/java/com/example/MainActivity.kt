@@ -60,6 +60,7 @@ import com.example.ui.components.FullScreenMusicPlayer
 import com.example.ui.components.MediaSaveNavigationDrawerContent
 import com.example.ui.components.MediaSaveSplashScreen
 import com.example.ui.components.PrivacyPolicyDialog
+import com.example.ui.components.ShareIntentErrorOverlay
 import com.example.ui.components.StreamSelectionBottomSheet
 import com.example.ui.components.VideoPlayerModal
 import com.example.ui.screens.DownloadsQueueScreen
@@ -107,18 +108,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
+        setIntent(intent)
         handleIncomingShareIntent(intent)
     }
 
-    private fun handleIncomingShareIntent(intent: Intent?) {
-        if (intent?.action == Intent.ACTION_SEND && intent.type == "text/plain") {
-            val sharedText = intent.getStringExtra(Intent.EXTRA_TEXT)?.trim()
-            if (!sharedText.isNullOrBlank()) {
-                val urlRegex = Regex("(https?://\\S+|file://\\S+)")
-                val extractedUrl = urlRegex.find(sharedText)?.value ?: sharedText
-                viewModel.updateUrlInput(extractedUrl)
-                viewModel.analyzeCurrentUrl()
-            }
+    internal fun handleIncomingShareIntent(intent: Intent?) {
+        if (viewModel.handleIncomingShareIntent(intent)) {
+            // Clear action after consuming so configuration changes do not re-trigger the same intent
+            intent?.action = null
         }
     }
 }
@@ -156,6 +153,7 @@ fun MediaSaveAppRoot(viewModel: MediaSaveViewModel) {
     val selectedAudioOutput by viewModel.selectedAudioOutput.collectAsStateWithLifecycle()
     val showStreamSelectionSheet by viewModel.showStreamSelectionSheet.collectAsStateWithLifecycle()
     val showActiveDownloadingScreen by viewModel.showActiveDownloadingScreen.collectAsStateWithLifecycle()
+    val isShareIntentFlow by viewModel.isShareIntentFlow.collectAsStateWithLifecycle()
     val duplicatePrompt by viewModel.duplicatePrompt.collectAsStateWithLifecycle()
     val snackbarMessage by viewModel.snackbarMessage.collectAsStateWithLifecycle()
     val activeVideoPlayback by viewModel.activeVideoPlayback.collectAsStateWithLifecycle()
@@ -173,7 +171,8 @@ fun MediaSaveAppRoot(viewModel: MediaSaveViewModel) {
         }
     }
 
-    if (showSplash) {
+    // Never show Splash Screen when launched via Android Share Intent (Share -> MediaSave)
+    if (showSplash && !isShareIntentFlow && !showStreamSelectionSheet && analysisState !is MediaAnalysisState.Analyzing) {
         MediaSaveSplashScreen(onSkipOrFinish = { showSplash = false })
         return
     }
@@ -183,6 +182,7 @@ fun MediaSaveAppRoot(viewModel: MediaSaveViewModel) {
         enabled = activeVideoPlayback != null ||
             showFullMusicPlayer ||
             showStreamSelectionSheet ||
+            isShareIntentFlow ||
             showActiveDownloadingScreen ||
             showVideoLibraryOverlay ||
             analysisState is MediaAnalysisState.Analyzing ||
@@ -192,6 +192,7 @@ fun MediaSaveAppRoot(viewModel: MediaSaveViewModel) {
             activeVideoPlayback != null -> viewModel.closeVideoPlayer()
             showFullMusicPlayer -> viewModel.closeFullMusicPlayer()
             showStreamSelectionSheet -> viewModel.dismissStreamSelectionSheet()
+            isShareIntentFlow -> viewModel.dismissShareIntentFlow()
             showActiveDownloadingScreen -> viewModel.closeActiveDownloadingScreen()
             showVideoLibraryOverlay -> showVideoLibraryOverlay = false
             analysisState is MediaAnalysisState.Analyzing -> viewModel.cancelAnalyzing()
@@ -445,13 +446,15 @@ fun MediaSaveAppRoot(viewModel: MediaSaveViewModel) {
     if (analyzingState != null) {
         AnalyzingLinkScreen(
             stageMessage = analyzingState.stageMessage,
-            onBack = viewModel::cancelAnalyzing
+            onBack = viewModel::cancelAnalyzing,
+            sharedUrl = analyzingState.url,
+            isFromShareIntent = isShareIntentFlow
         )
     }
 
     // Screen 4 (Video Download Options) & Screen 5 (Music Download Options) Full-Screen Overlay
     val currentSuccess = analysisState as? MediaAnalysisState.Success
-    if (showStreamSelectionSheet && currentSuccess != null) {
+    if ((showStreamSelectionSheet || isShareIntentFlow) && currentSuccess != null) {
         StreamSelectionBottomSheet(
             metadata = currentSuccess.metadata,
             selectedMode = selectedMode,
@@ -484,7 +487,20 @@ fun MediaSaveAppRoot(viewModel: MediaSaveViewModel) {
                     }
                 )
             },
-            onDismiss = viewModel::dismissStreamSelectionSheet
+            onDismiss = viewModel::dismissStreamSelectionSheet,
+            isFromShareIntent = isShareIntentFlow
+        )
+    }
+
+    // Direct Share Intent Error / Retry Overlay so errors during Share -> MediaSave do not drop onto Home Screen
+    val shareErrorState = analysisState as? MediaAnalysisState.Error
+    if (isShareIntentFlow && shareErrorState != null) {
+        ShareIntentErrorOverlay(
+            sharedUrl = shareErrorState.url,
+            errorTitle = shareErrorState.errorTitle,
+            errorMessage = shareErrorState.userMessage,
+            onRetry = { viewModel.analyzeCurrentUrl(isFromShareIntent = true) },
+            onDismissToHome = viewModel::dismissShareIntentFlow
         )
     }
 
