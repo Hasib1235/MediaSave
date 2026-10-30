@@ -1178,8 +1178,15 @@ class DownloadEngine(
         }
 
         activeResponse.use { response ->
-            // If Range is not satisfiable (HTTP 416), reset partial file and retry from byte 0
+            // If Range is not satisfiable (HTTP 416), check if file is already complete
             if (response.code == 416 && existingBytes > 0L) {
+                val contentRangeTotal = response.header("Content-Range")
+                    ?.substringAfterLast('/')
+                    ?.toLongOrNull() ?: 0L
+                if (contentRangeTotal > 0L && existingBytes >= contentRangeTotal) {
+                    // Full stream was already downloaded!
+                    return@withContext
+                }
                 response.close()
                 targetPartFile.delete()
                 transferStreamToFile(
@@ -1328,7 +1335,12 @@ class DownloadEngine(
             .replace("&&", "&")
             .trimEnd('?', '&')
         val clenFromUrl = Regex("[?&]clen=(\\d+)").find(baseCleanUrl)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 0L
-        var totalExpected = if (knownTotalBytes > 0L) knownTotalBytes else clenFromUrl
+        var totalExpected = when {
+            clenFromUrl > 0L -> clenFromUrl
+            knownTotalBytes > 0L && baseByteOffset > 0L -> (knownTotalBytes - baseByteOffset).coerceAtLeast(0L)
+            knownTotalBytes > 0L -> knownTotalBytes
+            else -> 0L
+        }
         val chunkSize = 4L * 1024L * 1024L // 4 MB per chunk
         var currentOffset = if (supportsResume && targetPartFile.exists()) targetPartFile.length() else 0L
         if (totalExpected > 0L && currentOffset > totalExpected) {
@@ -1417,6 +1429,15 @@ class DownloadEngine(
                     }
 
                     val code = resp.code
+                    if (code == 416) {
+                        resp.close()
+                        if (currentOffset > 0L) {
+                            chunkSuccess = true
+                            chunkBytesRead = 0L
+                            break
+                        }
+                    }
+
                     if (code in listOf(401, 403, 410, 429, 500, 502, 503)) {
                         resp.close()
                         delay(250L * (attempt + 1))
@@ -1500,15 +1521,13 @@ class DownloadEngine(
                 if (chunkBytesRead <= 0L) {
                     break
                 }
-                if (totalExpected <= 0L && chunkBytesRead < expectedChunkLen) {
+                if (chunkBytesRead < expectedChunkLen) {
+                    // Final chunk received to end of stream (EOF)
                     break
                 }
             }
         }
 
-        if (totalExpected > 0L && currentOffset < totalExpected) {
-            return false
-        }
         return currentOffset > 0L
     }
 
