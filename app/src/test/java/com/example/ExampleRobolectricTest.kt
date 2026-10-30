@@ -964,4 +964,49 @@ class ExampleRobolectricTest {
         freshRecoveryEngine.deleteTaskAndFile("legacy_403_task")
         db.close()
     }
+
+    @Test
+    fun `verify googlevideo download past 16MB 16777216 bytes`() = runBlocking {
+        val client = OkHttpClient.Builder()
+            .dns(com.example.data.platform.SocialStreamExtractor.IPV4_FIRST_DNS)
+            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+        val streams = com.example.data.platform.SocialStreamExtractor.extractYouTubeViaInnerTube(
+            client,
+            "dQw4w9WgXcQ"
+        )
+        println("EXTRACTED_STREAMS_COUNT=${streams?.videoStreams?.size}")
+        streams?.videoStreams?.forEach { s ->
+            println("STREAM id=${s.id} h=${s.resolutionHeight} type=${s.streamType} size=${s.estimatedSizeBytes} url=${s.downloadUrl.take(120)}")
+        }
+        val target = streams?.videoStreams?.maxByOrNull { it.estimatedSizeBytes }
+        if (target != null) {
+            val cleanUrl = com.example.data.platform.SocialStreamExtractor.stripUrlFragment(target.downloadUrl)
+            val headers = com.example.data.platform.SocialStreamExtractor.buildStreamRequestHeaders(cleanUrl)
+            // Test 1: Check what &range=16777216-20971519 vs Range: bytes=0- returns
+            val baseCleanUrl = cleanUrl.replace(Regex("([?&])range=[^&]+"), "$1").replace("?&", "?").replace("&&", "&").trimEnd('?', '&')
+            for (chunkIdx in 0..5) {
+                val start = chunkIdx * 4L * 1024L * 1024L
+                val end = start + 4L * 1024L * 1024L - 1L
+                val urlWithParam = "$baseCleanUrl&range=$start-$end"
+                val req = okhttp3.Request.Builder().url(urlWithParam).apply {
+                    headers.forEach { (k, v) -> header(k, v) }
+                }.build()
+                client.newCall(req).execute().use { resp ->
+                    val len = resp.body?.bytes()?.size ?: 0
+                    println("PARAM_CHUNK idx=$chunkIdx offset=$start code=${resp.code} read=$len ct=${resp.header("Content-Type")} cr=${resp.header("Content-Range")}")
+                }
+            }
+            // Test 2: HTTP Range header
+            val reqRange = okhttp3.Request.Builder().url(baseCleanUrl).apply {
+                headers.forEach { (k, v) -> header(k, v) }
+                header("Range", "bytes=16777216-20971519")
+            }.build()
+            client.newCall(reqRange).execute().use { resp ->
+                val len = resp.body?.bytes()?.size ?: 0
+                println("HEADER_RANGE offset=16777216 code=${resp.code} read=$len cr=${resp.header("Content-Range")}")
+            }
+        }
+    }
 }

@@ -596,12 +596,7 @@ object SocialStreamExtractor {
             validVideo.add(prog.copy(downloadUrl = appendVideoIdFragment(prog.downloadUrl, videoId)))
         }
         for (adap in adaptiveVideos) {
-            val taggedUrl = if (!primaryProgressiveUrl.isNullOrBlank()) {
-                val encodedFb = runCatching { URLEncoder.encode(primaryProgressiveUrl, "UTF-8") }.getOrDefault("")
-                "${appendVideoIdFragment(adap.downloadUrl, videoId)}&fb=$encodedFb"
-            } else {
-                appendVideoIdFragment(adap.downloadUrl, videoId)
-            }
+            val taggedUrl = appendVideoIdFragment(adap.downloadUrl, videoId)
             val taggedPairedAudio = adap.pairedAudioStreamUrl?.let { appendVideoIdFragment(it, videoId) }
             validVideo.add(
                 adap.copy(
@@ -612,12 +607,7 @@ object SocialStreamExtractor {
         }
 
         for (aud in extracted.audioStreams) {
-            val taggedUrl = if (!primaryProgressiveUrl.isNullOrBlank() && !aud.isExtractedFromVideo) {
-                val encodedFb = runCatching { URLEncoder.encode(primaryProgressiveUrl, "UTF-8") }.getOrDefault("")
-                "${appendVideoIdFragment(aud.downloadUrl, videoId)}&fb=$encodedFb"
-            } else {
-                appendVideoIdFragment(aud.downloadUrl, videoId)
-            }
+            val taggedUrl = appendVideoIdFragment(aud.downloadUrl, videoId)
             validAudio.add(aud.copy(downloadUrl = taggedUrl))
         }
 
@@ -942,23 +932,38 @@ object SocialStreamExtractor {
             }
         }
 
-        // 3. Collect adaptive high-resolution H.264 MP4 video streams paired with M4A audio for MediaMuxer
+        // 3. Collect adaptive high-resolution video streams (1080p FHD, 1440p QHD, 2160p 4K, 720p HD, etc.)
         val bestM4aAudio = audioStreams
             .filter { it.sourceFormat == AudioFormat.M4A && !it.isExtractedFromVideo }
             .maxByOrNull { it.bitrateKbps }
             ?: audioStreams.firstOrNull { !it.isExtractedFromVideo }
+            ?: audioStreams.firstOrNull()
 
         for (i in 0 until adaptiveFormats.length()) {
             val item = adaptiveFormats.optJSONObject(i) ?: continue
             val streamUrl = resolveInnerTubeStreamUrl(item) ?: continue
             val mimeRaw = item.optString("mimeType").lowercase()
-            if (!mimeRaw.startsWith("video/mp4") || !mimeRaw.contains("avc1")) continue
+            if (!mimeRaw.startsWith("video/")) continue
 
             val width = item.optInt("width", 1280)
             val height = item.optInt("height", 720)
-            if (height !in 240..1080) continue
-            if (videoStreams.any { it.resolutionHeight == height }) {
-                continue
+            if (height !in 144..4320) continue
+
+            val isMp4 = mimeRaw.contains("mp4")
+            val isAvc = mimeRaw.contains("avc1")
+            val isAv1 = mimeRaw.contains("av01")
+            val isVp9 = mimeRaw.contains("vp9") || mimeRaw.contains("vp09")
+            val isWebm = mimeRaw.contains("webm")
+
+            // Deduplicate by height: prefer AVC1 (MP4) for maximum compatibility, but keep highest resolutions
+            val existingIndex = videoStreams.indexOfFirst { it.resolutionHeight == height }
+            if (existingIndex >= 0) {
+                val existing = videoStreams[existingIndex]
+                if (existing.container == VideoContainerFormat.WEBM && isMp4 && isAvc) {
+                    videoStreams.removeAt(existingIndex)
+                } else {
+                    continue
+                }
             }
 
             val fps = item.optInt("fps", 30)
@@ -967,15 +972,24 @@ object SocialStreamExtractor {
             val contentLen = item.optString("contentLength").toLongOrNull()
                 ?: if (durationSec > 0) (bitrateBps * durationSec) / 8L else 0L
 
+            val codecLabel = when {
+                isAvc -> "H.264 (AVC1)"
+                isAv1 -> "AV1"
+                isVp9 -> "VP9"
+                isMp4 -> "MP4 Video"
+                else -> "WebM Video"
+            }
+            val containerFmt = if (isWebm) VideoContainerFormat.WEBM else VideoContainerFormat.MP4
+
             videoStreams.add(
                 VideoStreamOption(
                     id = "yt_adap_${height}p_${item.optInt("itag", i)}",
                     resolutionHeight = height,
                     resolutionWidth = width,
                     resolutionLabel = MediaProcessorEngine.resolutionLabelForHeight(width, height),
-                    videoCodec = "H.264 (AVC1)",
+                    videoCodec = codecLabel,
                     audioCodec = if (bestM4aAudio != null) null else "AAC-LC",
-                    container = VideoContainerFormat.MP4,
+                    container = containerFmt,
                     streamType = if (bestM4aAudio != null) StreamType.VIDEO_ONLY else StreamType.PROGRESSIVE,
                     frameRate = fps,
                     isHdr = item.optString("qualityLabel").contains("HDR", ignoreCase = true),
@@ -1258,7 +1272,7 @@ object SocialStreamExtractor {
 
                         val parsedQualityHeight = Regex("(\\d{3,4})p").find(qualityRaw)?.groupValues?.getOrNull(1)?.toIntOrNull()
                         val height = vObj.optInt("height", 0).takeIf { it > 0 } ?: parsedQualityHeight ?: 360
-                        if (height !in 240..1080) continue
+                        if (height !in 144..4320) continue
                         val width = vObj.optInt("width", 0).takeIf { it > 0 } ?: ((height * 16) / 9)
                         val fps = vObj.optInt("fps", 30).takeIf { it > 0 } ?: 30
                         val rawBitrate = vObj.optInt("bitrate", 0).takeIf { it > 0 }
@@ -1266,7 +1280,8 @@ object SocialStreamExtractor {
                         val kbps = (rawBitrate / 1000).coerceAtLeast(128)
                         val isWebm = formatRaw.contains("WEBM", true) || mimeRaw.contains("webm", true)
                         val isAv1 = codecRaw.contains("av01", true)
-                        if (videoOnly && (isWebm || isAv1 || bestM4aAudio == null)) continue
+                        val pairAudio = bestM4aAudio ?: audioStreams.firstOrNull()
+                        if (videoOnly && pairAudio == null) continue
                         if (videoStreams.any { it.resolutionHeight == height && (!it.id.contains("_vo_") || videoOnly) }) continue
                         videoStreams.removeAll { it.resolutionHeight == height && it.streamType == StreamType.VIDEO_ONLY && !videoOnly }
 
@@ -1497,12 +1512,11 @@ object SocialStreamExtractor {
                 if (profile.isEmbedded) continue
                 val raw = tryInnerTubeProfile(httpClient, youtubeVideoId, profile, null, null) ?: continue
                 val candidates = if (isAudio) {
-                    raw.audioStreams.map { it.downloadUrl } +
-                        raw.videoStreams.filter { !it.id.contains("_adap_") }.map { it.downloadUrl }
+                    raw.audioStreams.map { it.downloadUrl } + raw.videoStreams.map { it.downloadUrl }
                 } else {
-                    raw.videoStreams.sortedBy { kotlin.math.abs(it.resolutionHeight - preferredHeight.coerceAtLeast(360)) }
-                        .map { it.downloadUrl } +
-                        raw.videoStreams.filter { !it.id.contains("_adap_") }.map { it.downloadUrl }
+                    val exactHeight = raw.videoStreams.filter { it.resolutionHeight == preferredHeight }.map { it.downloadUrl }
+                    val nearHeight = raw.videoStreams.sortedBy { kotlin.math.abs(it.resolutionHeight - preferredHeight) }.map { it.downloadUrl }
+                    (exactHeight + nearHeight).distinct()
                 }
                 for (candidate in candidates) {
                     val cleanCandidate = stripUrlFragment(candidate)
@@ -1517,7 +1531,8 @@ object SocialStreamExtractor {
                 val candidate = if (isAudio) {
                     piped.audioStreams.firstOrNull()?.downloadUrl
                 } else {
-                    piped.videoStreams.minByOrNull { kotlin.math.abs(it.resolutionHeight - preferredHeight.coerceAtLeast(360)) }?.downloadUrl
+                    piped.videoStreams.firstOrNull { it.resolutionHeight == preferredHeight }?.downloadUrl
+                        ?: piped.videoStreams.minByOrNull { kotlin.math.abs(it.resolutionHeight - preferredHeight) }?.downloadUrl
                         ?: piped.videoStreams.firstOrNull()?.downloadUrl
                 }?.let(::stripUrlFragment)
                 if (!candidate.isNullOrBlank() && candidate != cleanFailed) {
@@ -1527,8 +1542,13 @@ object SocialStreamExtractor {
 
             // Try Invidious fallback
             extractYouTubeViaInvidious(httpClient, youtubeVideoId)?.let { inv ->
-                val candidate = (if (isAudio) inv.audioStreams.firstOrNull()?.downloadUrl else inv.videoStreams.firstOrNull()?.downloadUrl)
-                    ?.let(::stripUrlFragment)
+                val candidate = (if (isAudio) {
+                    inv.audioStreams.firstOrNull()?.downloadUrl
+                } else {
+                    inv.videoStreams.firstOrNull { it.resolutionHeight == preferredHeight }?.downloadUrl
+                        ?: inv.videoStreams.minByOrNull { kotlin.math.abs(it.resolutionHeight - preferredHeight) }?.downloadUrl
+                        ?: inv.videoStreams.firstOrNull()?.downloadUrl
+                })?.let(::stripUrlFragment)
                 if (!candidate.isNullOrBlank() && candidate != cleanFailed && isStreamUrlDownloadable(httpClient, candidate)) {
                     return candidate
                 }
@@ -1593,6 +1613,21 @@ object SocialStreamExtractor {
                 downloadUrl = "$cleanSource#fallback_res=360p"
             ),
             VideoStreamOption(
+                id = "social_fallback_480p",
+                resolutionHeight = 480,
+                resolutionWidth = 854,
+                resolutionLabel = "480p SD",
+                videoCodec = "H.264 (AVC1)",
+                audioCodec = "AAC-LC",
+                container = VideoContainerFormat.MP4,
+                streamType = StreamType.PROGRESSIVE,
+                frameRate = 30,
+                isHdr = false,
+                bitrateKbps = 1100,
+                estimatedSizeBytes = durationSec * 140_000L,
+                downloadUrl = "$cleanSource#fallback_res=480p"
+            ),
+            VideoStreamOption(
                 id = "social_fallback_720p",
                 resolutionHeight = 720,
                 resolutionWidth = 1280,
@@ -1621,6 +1656,36 @@ object SocialStreamExtractor {
                 bitrateKbps = 4200,
                 estimatedSizeBytes = durationSec * 525_000L,
                 downloadUrl = "$cleanSource#fallback_res=1080p"
+            ),
+            VideoStreamOption(
+                id = "social_fallback_1440p",
+                resolutionHeight = 1440,
+                resolutionWidth = 2560,
+                resolutionLabel = "1440p QHD",
+                videoCodec = "H.264 (AVC1)",
+                audioCodec = "AAC-LC",
+                container = VideoContainerFormat.MP4,
+                streamType = StreamType.PROGRESSIVE,
+                frameRate = 60,
+                isHdr = false,
+                bitrateKbps = 8000,
+                estimatedSizeBytes = durationSec * 1_000_000L,
+                downloadUrl = "$cleanSource#fallback_res=1440p"
+            ),
+            VideoStreamOption(
+                id = "social_fallback_2160p",
+                resolutionHeight = 2160,
+                resolutionWidth = 3840,
+                resolutionLabel = "2160p 4K",
+                videoCodec = "H.264 (AVC1)",
+                audioCodec = "AAC-LC",
+                container = VideoContainerFormat.MP4,
+                streamType = StreamType.PROGRESSIVE,
+                frameRate = 60,
+                isHdr = false,
+                bitrateKbps = 16000,
+                estimatedSizeBytes = durationSec * 2_000_000L,
+                downloadUrl = "$cleanSource#fallback_res=2160p"
             )
         )
         val audioStreams = listOf(
