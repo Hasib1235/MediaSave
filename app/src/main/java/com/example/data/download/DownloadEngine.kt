@@ -1341,7 +1341,7 @@ class DownloadEngine(
             knownTotalBytes > 0L -> knownTotalBytes
             else -> 0L
         }
-        val chunkSize = 4L * 1024L * 1024L // 4 MB per chunk
+        val chunkSize = 2L * 1024L * 1024L // 2 MB per chunk (YouTube mobile standard buffer window)
         var currentOffset = if (supportsResume && targetPartFile.exists()) targetPartFile.length() else 0L
         if (totalExpected > 0L && currentOffset > totalExpected) {
             currentOffset = 0L
@@ -1368,21 +1368,20 @@ class DownloadEngine(
                 } else {
                     currentOffset + chunkSize - 1L
                 }
-                val expectedChunkLen = (chunkEnd - currentOffset + 1L).coerceAtLeast(1L)
                 var chunkBytesRead = 0L
                 var chunkSuccess = false
 
-                for (attempt in 0 until 6) {
+                for (attempt in 0 until 8) {
                     val currentTask = dao.getTaskById(taskId)
                     val targetHeight = currentTask?.height ?: 720
 
-                    // On retries after 403 or failure: refresh URL and refresh headers
-                    if (attempt >= 2) {
+                    // On retries or 403: resolve a fresh stream URL
+                    if (attempt >= 1) {
                         val freshUrl = if (recoveryDepth < 4) {
                             SocialStreamExtractor.resolveFreshStreamUrlOn403(
                                 httpClient = httpClient,
                                 failedUrl = activeCleanUrl,
-                                originPageUrl = taskOriginUrls[taskId],
+                                originPageUrl = taskOriginUrls[taskId] ?: currentTask?.sourceUrl,
                                 thumbnailUrl = currentTask?.thumbnailUrl,
                                 isAudio = currentTask?.mode == DownloaderMode.MUSIC.name || baseByteOffset > 0L,
                                 preferredHeight = targetHeight
@@ -1395,45 +1394,47 @@ class DownloadEngine(
                                 .replace("?&", "?")
                                 .replace("&&", "&")
                                 .trimEnd('?', '&')
-                            if (currentTask != null && baseByteOffset == 0L) {
-                                dao.upsertTask(currentTask.copy(sourceUrl = freshUrl))
+                            if (currentTask != null) {
+                                if (baseByteOffset == 0L) {
+                                    dao.upsertTask(currentTask.copy(sourceUrl = freshUrl))
+                                } else {
+                                    dao.upsertTask(currentTask.copy(secondaryAudioUrl = freshUrl))
+                                }
                             }
                         }
-                        delay(250L * attempt)
+                        delay(200L * attempt)
                     }
 
+                    // Build headers matched to the URL's client (e.g. c=ANDROID, c=IOS), and on retry attempt 1 or 3 try Oculus VR profile
                     val headers = SocialStreamExtractor.buildStreamRequestHeaders(baseCleanUrl).toMutableMap()
                     if (attempt in listOf(1, 3)) {
                         headers["User-Agent"] = "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; en_US; eureka-user Build/SQ3A.220605.009.A1) gzip"
-                    } else if (attempt in listOf(2, 4)) {
-                        headers["User-Agent"] = "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)"
                     }
-                    val reqBuilder = Request.Builder()
+                    val sep = if (baseCleanUrl.contains("?")) "&" else "?"
+                    val chunkUrl = "${baseCleanUrl}${sep}range=$currentOffset-$chunkEnd"
 
-                    // Alternate between URL query param range and standard HTTP Range header
-                    if (attempt % 2 == 0) {
-                        val sep = if (baseCleanUrl.contains("?")) "&" else "?"
-                        val chunkUrl = "${baseCleanUrl}${sep}range=$currentOffset-$chunkEnd"
-                        reqBuilder.url(chunkUrl).get()
-                    } else {
-                        reqBuilder.url(baseCleanUrl).get().header("Range", "bytes=$currentOffset-$chunkEnd")
-                    }
+                    val reqBuilder = Request.Builder()
+                        .url(chunkUrl)
+                        .get()
+                        .header("Range", "bytes=$currentOffset-$chunkEnd")
                     for ((k, v) in headers) {
                         reqBuilder.header(k, v)
                     }
 
                     val resp = runCatching { httpClient.newCall(reqBuilder.build()).execute() }.getOrNull()
                     if (resp == null) {
-                        delay(200L * (attempt + 1))
+                        delay(250L * (attempt + 1))
                         continue
                     }
 
                     val code = resp.code
+                    // HTTP 416: Range Not Satisfiable means we reached or exceeded the actual stream end
                     if (code == 416) {
                         resp.close()
                         if (currentOffset > 0L) {
                             chunkSuccess = true
                             chunkBytesRead = 0L
+                            totalExpected = currentOffset // Stream EOF reached
                             break
                         }
                     }
@@ -1458,7 +1459,7 @@ class DownloadEngine(
                     val contentRangeTotal = resp.header("Content-Range")
                         ?.substringAfterLast('/')
                         ?.toLongOrNull()
-                    if (totalExpected <= 0L && contentRangeTotal != null && contentRangeTotal > 0L) {
+                    if (contentRangeTotal != null && contentRangeTotal > 0L) {
                         totalExpected = contentRangeTotal
                     }
 
@@ -1514,21 +1515,41 @@ class DownloadEngine(
                 }
 
                 if (!chunkSuccess) {
-                    // Fall back to outer ranged HTTP stream from currentOffset
+                    // Try queued alternative fallback URLs if available
+                    val queuedFallbacks = taskFallbackUrls[taskId].orEmpty()
+                    val nextFallback = queuedFallbacks.firstOrNull {
+                        SocialStreamExtractor.stripUrlFragment(it) != activeCleanUrl
+                    }
+                    if (nextFallback != null) {
+                        taskFallbackUrls[taskId] = queuedFallbacks.filter { it != nextFallback }
+                        activeCleanUrl = nextFallback
+                        baseCleanUrl = activeCleanUrl.replace(Regex("([?&])range=[^&]+"), "$1")
+                            .replace("?&", "?")
+                            .replace("&&", "&")
+                            .trimEnd('?', '&')
+                        continue
+                    }
                     return false
                 }
 
+                // If chunk read 0 bytes, only break if totalExpected <= 0 or currentOffset reached totalExpected
                 if (chunkBytesRead <= 0L) {
+                    if (totalExpected > 0L && currentOffset < totalExpected) {
+                        // Server closed connection with 0 bytes read on this attempt; retry next attempt
+                        delay(200)
+                        continue
+                    }
                     break
                 }
-                if (chunkBytesRead < expectedChunkLen) {
-                    // Final chunk received to end of stream (EOF)
+
+                // Check if stream reached total expected length
+                if (totalExpected > 0L && currentOffset >= totalExpected) {
                     break
                 }
             }
         }
 
-        return currentOffset > 0L
+        return currentOffset > 0L && (totalExpected <= 0L || currentOffset >= totalExpected)
     }
 
     private fun tryAlternativeHeaderProfiles(
@@ -1666,6 +1687,19 @@ class DownloadEngine(
     companion object {
         private const val TAG = "MediaSaveDownloadEngine"
         private const val CHANNEL_ID = "mediasave_downloads_channel"
+
+        @Volatile
+        private var INSTANCE: DownloadEngine? = null
+
+        fun getInstance(context: Context, dao: DownloadTaskDao): DownloadEngine {
+            return INSTANCE ?: synchronized(this) {
+                INSTANCE ?: DownloadEngine(
+                    context = context.applicationContext,
+                    dao = dao,
+                    externalScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+                ).also { INSTANCE = it }
+            }
+        }
 
         fun formatBytesStatic(bytes: Long): String {
             if (bytes <= 0L) return "0 B"

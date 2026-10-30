@@ -66,11 +66,7 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
     private val dao = database.downloadTaskDao()
     private val preferencesRepository = UserPreferencesRepository(application)
     private val adapterRegistry = PlatformAdapterRegistry()
-    val downloadEngine = DownloadEngine(
-        application,
-        dao,
-        CoroutineScope(viewModelScope.coroutineContext + Dispatchers.IO)
-    )
+    val downloadEngine = DownloadEngine.getInstance(application, dao)
 
     val userSettings: StateFlow<UserSettings> = preferencesRepository.settingsFlow
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), UserSettings())

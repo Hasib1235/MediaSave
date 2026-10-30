@@ -565,13 +565,19 @@ object SocialStreamExtractor {
             return false
         }
         return try {
-            val reqBuilder = Request.Builder().url(cleanUrl).get()
-            for ((k, v) in buildStreamRequestHeaders(cleanUrl)) {
+            val testUrl = if (cleanUrl.contains("googlevideo.com") && !cleanUrl.contains("range=")) {
+                val sep = if (cleanUrl.contains("?")) "&" else "?"
+                "${cleanUrl}${sep}range=0-1023"
+            } else {
+                cleanUrl
+            }
+            val reqBuilder = Request.Builder().url(testUrl).get()
+            for ((k, v) in buildStreamRequestHeaders(testUrl)) {
                 reqBuilder.header(k, v)
             }
             reqBuilder.header("Range", "bytes=0-1023")
             httpClient.newCall(reqBuilder.build()).execute().use { resp ->
-                if (resp.code !in 200..299) return false
+                if (resp.code !in 200..299 && resp.code != 206) return false
                 val ct = resp.header("Content-Type")?.substringBefore(';')?.trim()?.lowercase().orEmpty()
                 !ct.startsWith("text/html") && !ct.startsWith("application/xhtml")
             }
