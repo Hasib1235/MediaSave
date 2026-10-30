@@ -1083,234 +1083,244 @@ class DownloadEngine(
         val lowerUrl = cleanUrl.lowercase()
         val host = runCatching { URI(cleanUrl).host?.lowercase() }.getOrNull().orEmpty()
 
-        // Fast & reliable 4 MB chunked `&range=start-end` transfer for googlevideo.com streams
-        // Prevents YouTube CDN throttling or mid-stream resets on multi-megabyte videos (e.g. 23 MB+)
-        if (host.contains("googlevideo.com")) {
-            val chunkedSuccess = transferGoogleVideoChunked(
-                taskId = taskId,
-                sourceUrl = sourceUrl,
-                cleanUrl = cleanUrl,
-                targetPartFile = targetPartFile,
-                supportsResume = supportsResume,
-                knownTotalBytes = knownTotalBytes,
-                baseByteOffset = baseByteOffset,
-                recoveryDepth = recoveryDepth
-            )
-            if (chunkedSuccess) {
-                return@withContext
+
+        try {
+            val reqBuilder = Request.Builder().url(cleanUrl)
+            for ((headerName, headerVal) in SocialStreamExtractor.buildStreamRequestHeaders(cleanUrl)) {
+                reqBuilder.header(headerName, headerVal)
             }
-        }
-
-        val reqBuilder = Request.Builder().url(cleanUrl)
-        for ((headerName, headerVal) in SocialStreamExtractor.buildStreamRequestHeaders(cleanUrl)) {
-            reqBuilder.header(headerName, headerVal)
-        }
-        if (existingBytes > 0L && supportsResume) {
-            reqBuilder.header("Range", "bytes=$existingBytes-")
-        }
-
-        val initialResponse = httpClient.newCall(reqBuilder.build()).execute()
-        val activeResponse = if (initialResponse.code in listOf(401, 403, 410)) {
-            val initialCode = initialResponse.code
-            initialResponse.close()
-
-            if (initialCode == 410) {
-                throw IOException("Media link has expired and is no longer available (HTTP 410).")
+            if (existingBytes > 0L && supportsResume) {
+                reqBuilder.header("Range", "bytes=$existingBytes-")
             }
 
-            // Step A: Try alternative User-Agent / Range / Referer header profiles on the same URL
-            val altResponse = tryAlternativeHeaderProfiles(cleanUrl, existingBytes, supportsResume)
-            if (altResponse != null) {
-                altResponse
+            val initialResponse = httpClient.newCall(reqBuilder.build()).execute()
+            val activeResponse = if (initialResponse.code in listOf(401, 403, 410)) {
+                val initialCode = initialResponse.code
+                initialResponse.close()
+
+                if (initialCode == 410) {
+                    throw IOException("Media link has expired and is no longer available (HTTP 410).")
+                }
+
+                // Step A: Try alternative User-Agent / Range / Referer header profiles on the same URL
+                val altResponse = tryAlternativeHeaderProfiles(cleanUrl, existingBytes, supportsResume)
+                if (altResponse != null) {
+                    altResponse
+                } else {
+                    // Step B: Try candidate fallback URLs from the same extraction or resolve a fresh non-403 URL
+                    val currentTask = dao.getTaskById(taskId)
+                    dao.updateProgress(
+                        id = taskId,
+                        downloadedBytes = existingBytes,
+                        totalBytes = knownTotalBytes,
+                        speedBytesPerSec = 0L,
+                        etaSeconds = -1L,
+                        status = DownloadStatus.DOWNLOADING.name,
+                        statusDetail = "Switching to backup media stream..."
+                    )
+
+                    val queuedFallbacks = taskFallbackUrls[taskId].orEmpty()
+                    val nextQueuedFallback = queuedFallbacks.firstOrNull {
+                        SocialStreamExtractor.stripUrlFragment(it) != cleanUrl
+                    }
+                    if (nextQueuedFallback != null) {
+                        taskFallbackUrls[taskId] = queuedFallbacks.filter { it != nextQueuedFallback }
+                    }
+
+                    val freshUrl = if (recoveryDepth < 2) {
+                        nextQueuedFallback ?: SocialStreamExtractor.resolveFreshStreamUrlOn403(
+                            httpClient = httpClient,
+                            failedUrl = sourceUrl,
+                            originPageUrl = taskOriginUrls[taskId],
+                            thumbnailUrl = currentTask?.thumbnailUrl,
+                            isAudio = currentTask?.mode == DownloaderMode.MUSIC.name || baseByteOffset > 0L,
+                            preferredHeight = currentTask?.height ?: 720
+                        )
+                    } else null
+
+                    if (!freshUrl.isNullOrBlank() && SocialStreamExtractor.stripUrlFragment(freshUrl) != cleanUrl) {
+                        if (currentTask != null && baseByteOffset == 0L) {
+                            dao.upsertTask(currentTask.copy(sourceUrl = freshUrl))
+                        }
+                        if (!supportsResume && targetPartFile.exists()) targetPartFile.delete()
+                        transferStreamToFile(
+                            taskId = taskId,
+                            sourceUrl = freshUrl,
+                            targetPartFile = targetPartFile,
+                            supportsResume = supportsResume,
+                            knownTotalBytes = knownTotalBytes,
+                            baseByteOffset = baseByteOffset,
+                            recoveryDepth = recoveryDepth + 1
+                        )
+                        return@withContext
+                    }
+
+                    throw IOException("Access denied or expired media link (HTTP $initialCode). Please re-analyze the source URL.")
+                }
             } else {
-                // Step B: Try candidate fallback URLs from the same extraction or resolve a fresh non-403 URL
-                val currentTask = dao.getTaskById(taskId)
+                initialResponse
+            }
+
+            activeResponse.use { response ->
+                // If Range is not satisfiable (HTTP 416), check if file is already complete
+                if (response.code == 416 && existingBytes > 0L) {
+                    val contentRangeTotal = response.header("Content-Range")
+                        ?.substringAfterLast('/')
+                        ?.toLongOrNull() ?: 0L
+                    if (contentRangeTotal > 0L && existingBytes >= contentRangeTotal) {
+                        // Full stream was already downloaded!
+                        return@withContext
+                    }
+                    response.close()
+                    targetPartFile.delete()
+                    transferStreamToFile(
+                        taskId = taskId,
+                        sourceUrl = sourceUrl,
+                        targetPartFile = targetPartFile,
+                        supportsResume = false,
+                        knownTotalBytes = knownTotalBytes,
+                        baseByteOffset = baseByteOffset,
+                        recoveryDepth = recoveryDepth
+                    )
+                    return@withContext
+                }
+
+                if (!response.isSuccessful) {
+                    val message = when (response.code) {
+                        401, 403 -> "Access denied or expired media link (HTTP ${response.code}). Please re-analyze the source URL."
+                        404 -> "Media file not found on remote server (HTTP 404)."
+                        410 -> "Media link has expired and is no longer available (HTTP 410)."
+                        429 -> "Rate limited by remote server (HTTP 429). Please wait and retry."
+                        in 500..599 -> "Remote media server error (HTTP ${response.code} ${response.message})."
+                        else -> "Server returned HTTP ${response.code} (${response.message})."
+                    }
+                    throw IOException(message)
+                }
+
+                val contentType = response.header("Content-Type")?.substringBefore(';')?.trim()?.lowercase().orEmpty()
+                if (contentType.startsWith("text/html") || contentType.startsWith("application/xhtml")) {
+                    targetPartFile.delete()
+                    throw IllegalStateException(
+                        "Server returned an HTML webpage ($contentType) instead of a downloadable media file."
+                    )
+                }
+
+                val isPartialContent = response.code == 206
+                val startOffset = if (isPartialContent) existingBytes else 0L
+                val body = response.body ?: throw IOException("Server returned an empty HTTP response body.")
+                val contentLen = body.contentLength()
+                if (contentLen > 0L) {
+                    checkAvailableStorageSpace(contentLen)
+                }
+
+                val overallTotal = when {
+                    contentLen > 0 -> baseByteOffset + startOffset + contentLen
+                    knownTotalBytes > 0 -> knownTotalBytes
+                    else -> -1L
+                }
+
+                RandomAccessFile(targetPartFile, "rw").use { outputRaf ->
+                    if (!isPartialContent) {
+                        outputRaf.setLength(0L)
+                    }
+                    outputRaf.seek(startOffset)
+
+                    body.byteStream().use { inputStream ->
+                        val buffer = ByteArray(64 * 1024)
+                        var downloaded = startOffset
+                        var sessionBytesRead = 0L
+                        var inspectedFirstChunk = startOffset > 0L
+                        var windowStart = System.currentTimeMillis()
+                        var windowBytes = 0L
+                        var lastDbUpdate = 0L
+
+                        while (true) {
+                            val read = inputStream.read(buffer)
+                            if (read == -1) break
+
+                            if (!inspectedFirstChunk && read > 0) {
+                                inspectedFirstChunk = true
+                                val headSample = String(buffer, 0, minOf(read, 256), Charsets.UTF_8).trimStart().lowercase()
+                                if (headSample.startsWith("<!doctype html") || headSample.startsWith("<html")) {
+                                    outputRaf.close()
+                                    targetPartFile.delete()
+                                    throw IllegalStateException(
+                                        "Downloaded response is an HTML webpage rather than a valid media container."
+                                    )
+                                }
+                            }
+
+                            outputRaf.write(buffer, 0, read)
+                            downloaded += read
+                            sessionBytesRead += read
+                            windowBytes += read
+
+                            val now = System.currentTimeMillis()
+                            if (now - lastDbUpdate >= 100L) {
+                                val elapsedMs = (now - windowStart).coerceAtLeast(1L)
+                                val speedBps = (windowBytes * 1000L) / elapsedMs
+                                val currentOverall = baseByteOffset + downloaded
+                                val rem = if (overallTotal > 0) (overallTotal - currentOverall).coerceAtLeast(0L) else 0L
+                                val etaSec = if (speedBps > 0 && overallTotal > 0) rem / speedBps else -1L
+
+                                dao.updateProgress(
+                                    id = taskId,
+                                    downloadedBytes = currentOverall,
+                                    totalBytes = overallTotal.coerceAtLeast(currentOverall),
+                                    speedBytesPerSec = speedBps,
+                                    etaSeconds = etaSec,
+                                    status = DownloadStatus.DOWNLOADING.name,
+                                    statusDetail = if (isPartialContent) {
+                                        "Resumed via HTTP Range (206) • ${formatBytesStatic(currentOverall)}"
+                                    } else {
+                                        "Downloading HTTP stream • ${formatBytesStatic(currentOverall)}"
+                                    }
+                                )
+                                lastDbUpdate = now
+                                if (elapsedMs > 1000L) {
+                                    windowStart = now
+                                    windowBytes = 0L
+                                }
+                            }
+                        }
+
+                        // Verify complete payload was received when Content-Length was advertised
+                        if (contentLen > 0L && sessionBytesRead < contentLen) {
+                            throw EOFException(
+                                "Connection interrupted before completion: received ${formatBytesStatic(downloaded)} of ${formatBytesStatic(startOffset + contentLen)}."
+                            )
+                        }
+                        if (downloaded <= 0L) {
+                            throw EOFException("Remote server closed connection after sending 0 bytes.")
+                        }
+                    }
+                }
+            }
+        } catch (ioe: IOException) {
+            val currentLen = targetPartFile.length()
+            if (supportsResume && recoveryDepth < 5 && currentLen > existingBytes) {
+                Log.i(TAG, "Stream connection interrupted at $currentLen bytes. Auto-resuming...")
                 dao.updateProgress(
                     id = taskId,
-                    downloadedBytes = existingBytes,
+                    downloadedBytes = baseByteOffset + currentLen,
                     totalBytes = knownTotalBytes,
                     speedBytesPerSec = 0L,
                     etaSeconds = -1L,
                     status = DownloadStatus.DOWNLOADING.name,
-                    statusDetail = "Switching to backup media stream..."
+                    statusDetail = "Resuming stream (${formatBytesStatic(baseByteOffset + currentLen)})..."
                 )
-
-                val queuedFallbacks = taskFallbackUrls[taskId].orEmpty()
-                val nextQueuedFallback = queuedFallbacks.firstOrNull {
-                    SocialStreamExtractor.stripUrlFragment(it) != cleanUrl
-                }
-                if (nextQueuedFallback != null) {
-                    taskFallbackUrls[taskId] = queuedFallbacks.filter { it != nextQueuedFallback }
-                }
-
-                val freshUrl = if (recoveryDepth < 2) {
-                    nextQueuedFallback ?: SocialStreamExtractor.resolveFreshStreamUrlOn403(
-                        httpClient = httpClient,
-                        failedUrl = sourceUrl,
-                        originPageUrl = taskOriginUrls[taskId],
-                        thumbnailUrl = currentTask?.thumbnailUrl,
-                        isAudio = currentTask?.mode == DownloaderMode.MUSIC.name || baseByteOffset > 0L,
-                        preferredHeight = currentTask?.height ?: 720
-                    )
-                } else null
-
-                if (!freshUrl.isNullOrBlank() && SocialStreamExtractor.stripUrlFragment(freshUrl) != cleanUrl) {
-                    if (currentTask != null && baseByteOffset == 0L) {
-                        dao.upsertTask(currentTask.copy(sourceUrl = freshUrl))
-                    }
-                    if (!supportsResume && targetPartFile.exists()) targetPartFile.delete()
-                    transferStreamToFile(
-                        taskId = taskId,
-                        sourceUrl = freshUrl,
-                        targetPartFile = targetPartFile,
-                        supportsResume = supportsResume,
-                        knownTotalBytes = knownTotalBytes,
-                        baseByteOffset = baseByteOffset,
-                        recoveryDepth = recoveryDepth + 1
-                    )
-                    return@withContext
-                }
-
-                throw IOException("Access denied or expired media link (HTTP $initialCode). Please re-analyze the source URL.")
-            }
-        } else {
-            initialResponse
-        }
-
-        activeResponse.use { response ->
-            // If Range is not satisfiable (HTTP 416), check if file is already complete
-            if (response.code == 416 && existingBytes > 0L) {
-                val contentRangeTotal = response.header("Content-Range")
-                    ?.substringAfterLast('/')
-                    ?.toLongOrNull() ?: 0L
-                if (contentRangeTotal > 0L && existingBytes >= contentRangeTotal) {
-                    // Full stream was already downloaded!
-                    return@withContext
-                }
-                response.close()
-                targetPartFile.delete()
                 transferStreamToFile(
                     taskId = taskId,
                     sourceUrl = sourceUrl,
                     targetPartFile = targetPartFile,
-                    supportsResume = false,
+                    supportsResume = true,
                     knownTotalBytes = knownTotalBytes,
                     baseByteOffset = baseByteOffset,
-                    recoveryDepth = recoveryDepth
+                    recoveryDepth = recoveryDepth + 1
                 )
                 return@withContext
             }
-
-            if (!response.isSuccessful) {
-                val message = when (response.code) {
-                    401, 403 -> "Access denied or expired media link (HTTP ${response.code}). Please re-analyze the source URL."
-                    404 -> "Media file not found on remote server (HTTP 404)."
-                    410 -> "Media link has expired and is no longer available (HTTP 410)."
-                    429 -> "Rate limited by remote server (HTTP 429). Please wait and retry."
-                    in 500..599 -> "Remote media server error (HTTP ${response.code} ${response.message})."
-                    else -> "Server returned HTTP ${response.code} (${response.message})."
-                }
-                throw IOException(message)
-            }
-
-            val contentType = response.header("Content-Type")?.substringBefore(';')?.trim()?.lowercase().orEmpty()
-            if (contentType.startsWith("text/html") || contentType.startsWith("application/xhtml")) {
-                targetPartFile.delete()
-                throw IllegalStateException(
-                    "Server returned an HTML webpage ($contentType) instead of a downloadable media file."
-                )
-            }
-
-            val isPartialContent = response.code == 206
-            val startOffset = if (isPartialContent) existingBytes else 0L
-            val body = response.body ?: throw IOException("Server returned an empty HTTP response body.")
-            val contentLen = body.contentLength()
-            if (contentLen > 0L) {
-                checkAvailableStorageSpace(contentLen)
-            }
-
-            val overallTotal = when {
-                contentLen > 0 -> baseByteOffset + startOffset + contentLen
-                knownTotalBytes > 0 -> knownTotalBytes
-                else -> -1L
-            }
-
-            RandomAccessFile(targetPartFile, "rw").use { outputRaf ->
-                if (!isPartialContent) {
-                    outputRaf.setLength(0L)
-                }
-                outputRaf.seek(startOffset)
-
-                body.byteStream().use { inputStream ->
-                    val buffer = ByteArray(32 * 1024)
-                    var downloaded = startOffset
-                    var sessionBytesRead = 0L
-                    var inspectedFirstChunk = startOffset > 0L
-                    var windowStart = System.currentTimeMillis()
-                    var windowBytes = 0L
-                    var lastDbUpdate = 0L
-
-                    while (true) {
-                        val read = inputStream.read(buffer)
-                        if (read == -1) break
-
-                        if (!inspectedFirstChunk && read > 0) {
-                            inspectedFirstChunk = true
-                            val headSample = String(buffer, 0, minOf(read, 256), Charsets.UTF_8).trimStart().lowercase()
-                            if (headSample.startsWith("<!doctype html") || headSample.startsWith("<html")) {
-                                outputRaf.close()
-                                targetPartFile.delete()
-                                throw IllegalStateException(
-                                    "Downloaded response is an HTML webpage rather than a valid media container."
-                                )
-                            }
-                        }
-
-                        outputRaf.write(buffer, 0, read)
-                        downloaded += read
-                        sessionBytesRead += read
-                        windowBytes += read
-
-                        val now = System.currentTimeMillis()
-                        if (now - lastDbUpdate >= 100L) {
-                            val elapsedMs = (now - windowStart).coerceAtLeast(1L)
-                            val speedBps = (windowBytes * 1000L) / elapsedMs
-                            val currentOverall = baseByteOffset + downloaded
-                            val rem = if (overallTotal > 0) (overallTotal - currentOverall).coerceAtLeast(0L) else 0L
-                            val etaSec = if (speedBps > 0 && overallTotal > 0) rem / speedBps else -1L
-
-                            dao.updateProgress(
-                                id = taskId,
-                                downloadedBytes = currentOverall,
-                                totalBytes = overallTotal.coerceAtLeast(currentOverall),
-                                speedBytesPerSec = speedBps,
-                                etaSeconds = etaSec,
-                                status = DownloadStatus.DOWNLOADING.name,
-                                statusDetail = if (isPartialContent) {
-                                    "Resumed via HTTP Range (206) • ${formatBytesStatic(currentOverall)}"
-                                } else {
-                                    "Downloading HTTP stream • ${formatBytesStatic(currentOverall)}"
-                                }
-                            )
-                            lastDbUpdate = now
-                            if (elapsedMs > 1000L) {
-                                windowStart = now
-                                windowBytes = 0L
-                            }
-                        }
-                    }
-
-                    // Verify complete payload was received when Content-Length was advertised
-                    if (contentLen > 0L && sessionBytesRead < contentLen) {
-                        throw EOFException(
-                            "Connection interrupted before completion: received ${formatBytesStatic(downloaded)} of ${formatBytesStatic(startOffset + contentLen)}."
-                        )
-                    }
-                    if (downloaded <= 0L) {
-                        throw EOFException("Remote server closed connection after sending 0 bytes.")
-                    }
-                }
-            }
+            throw ioe
         }
     }
 
