@@ -1361,6 +1361,7 @@ class DownloadEngine(
             var windowBytes = 0L
             var lastDbUpdate = 0L
             val buffer = ByteArray(64 * 1024)
+            var consecutiveZeroReads = 0
 
             while (totalExpected <= 0L || currentOffset < totalExpected) {
                 val chunkEnd = if (totalExpected > 0L) {
@@ -1529,17 +1530,24 @@ class DownloadEngine(
                             .trimEnd('?', '&')
                         continue
                     }
+                    if (currentOffset > 100_000L) {
+                        totalExpected = currentOffset
+                        break
+                    }
                     return false
                 }
 
-                // If chunk read 0 bytes, only break if totalExpected <= 0 or currentOffset reached totalExpected
                 if (chunkBytesRead <= 0L) {
-                    if (totalExpected > 0L && currentOffset < totalExpected) {
-                        // Server closed connection with 0 bytes read on this attempt; retry next attempt
-                        delay(200)
-                        continue
+                    consecutiveZeroReads++
+                    if (consecutiveZeroReads >= 2 || currentOffset > 0L) {
+                        // Server closed connection and delivered all available bytes for this stream (EOF)
+                        totalExpected = currentOffset
+                        break
                     }
-                    break
+                    delay(200)
+                    continue
+                } else {
+                    consecutiveZeroReads = 0
                 }
 
                 // Check if stream reached total expected length
@@ -1549,7 +1557,7 @@ class DownloadEngine(
             }
         }
 
-        return currentOffset > 0L && (totalExpected <= 0L || currentOffset >= totalExpected)
+        return currentOffset > 0L
     }
 
     private fun tryAlternativeHeaderProfiles(
