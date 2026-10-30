@@ -31,6 +31,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Protocol
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.buffer
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
@@ -287,6 +288,13 @@ class ExampleRobolectricTest {
                 5 -> 't'.code.toByte()
                 6 -> 'y'.code.toByte()
                 7 -> 'p'.code.toByte()
+                24, 25 -> 0
+                26 -> 0x0F.toByte()
+                27 -> 0xE8.toByte() // 4096 - 24 = 4072 bytes
+                28 -> 'm'.code.toByte()
+                29 -> 'd'.code.toByte()
+                30 -> 'a'.code.toByte()
+                31 -> 't'.code.toByte()
                 else -> (idx % 251).toByte()
             }
         }
@@ -966,47 +974,473 @@ class ExampleRobolectricTest {
     }
 
     @Test
-    fun `verify googlevideo download past 16MB 16777216 bytes`() = runBlocking {
-        val client = OkHttpClient.Builder()
-            .dns(com.example.data.platform.SocialStreamExtractor.IPV4_FIRST_DNS)
-            .connectTimeout(15, java.util.concurrent.TimeUnit.SECONDS)
-            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+    fun `large 20MB multi-chunk googlevideo and adaptive dual-stream downloads complete past 16MB boundary with exact byte integrity`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
             .build()
-        val streams = com.example.data.platform.SocialStreamExtractor.extractYouTubeViaInnerTube(
-            client,
-            "dQw4w9WgXcQ"
-        )
-        println("EXTRACTED_STREAMS_COUNT=${streams?.videoStreams?.size}")
-        streams?.videoStreams?.forEach { s ->
-            println("STREAM id=${s.id} h=${s.resolutionHeight} type=${s.streamType} size=${s.estimatedSizeBytes} url=${s.downloadUrl.take(120)}")
-        }
-        val target = streams?.videoStreams?.maxByOrNull { it.estimatedSizeBytes }
-        if (target != null) {
-            val cleanUrl = com.example.data.platform.SocialStreamExtractor.stripUrlFragment(target.downloadUrl)
-            val headers = com.example.data.platform.SocialStreamExtractor.buildStreamRequestHeaders(cleanUrl)
-            // Test 1: Check what &range=16777216-20971519 vs Range: bytes=0- returns
-            val baseCleanUrl = cleanUrl.replace(Regex("([?&])range=[^&]+"), "$1").replace("?&", "?").replace("&&", "&").trimEnd('?', '&')
-            for (chunkIdx in 0..5) {
-                val start = chunkIdx * 4L * 1024L * 1024L
-                val end = start + 4L * 1024L * 1024L - 1L
-                val urlWithParam = "$baseCleanUrl&range=$start-$end"
-                val req = okhttp3.Request.Builder().url(urlWithParam).apply {
-                    headers.forEach { (k, v) -> header(k, v) }
-                }.build()
-                client.newCall(req).execute().use { resp ->
-                    val len = resp.body?.bytes()?.size ?: 0
-                    println("PARAM_CHUNK idx=$chunkIdx offset=$start code=${resp.code} read=$len ct=${resp.header("Content-Type")} cr=${resp.header("Content-Range")}")
+        val dao = db.downloadTaskDao()
+
+        // Create a 20 MB (20,971,520 bytes) payload that exceeds both the 2 MB and 16 MB (16,777,216) boundaries
+        val largeSize = 20 * 1024 * 1024
+        val largeVideoBytes = ByteArray(largeSize) { idx -> ((idx * 17 + 43) and 0xFF).toByte() }
+        val rangeRequestsSeen = java.util.concurrent.CopyOnWriteArrayList<String>()
+
+        val rangeServerClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                val rangeHeader = req.header("Range")
+                if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
+                    rangeRequestsSeen.add(rangeHeader)
+                    val spec = rangeHeader.removePrefix("bytes=")
+                    val start = spec.substringBefore('-').toIntOrNull() ?: 0
+                    val endRaw = spec.substringAfter('-', "").toIntOrNull()
+                    if (start >= largeSize) {
+                        return@addInterceptor Response.Builder()
+                            .request(req)
+                            .protocol(Protocol.HTTP_1_1)
+                            .code(416)
+                            .message("Range Not Satisfiable")
+                            .header("Content-Range", "bytes */$largeSize")
+                            .body("".toResponseBody("text/plain".toMediaType()))
+                            .build()
+                    }
+                    val end = minOf(endRaw ?: (largeSize - 1), largeSize - 1)
+                    val slice = largeVideoBytes.copyOfRange(start, end + 1)
+                    Response.Builder()
+                        .request(req)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(206)
+                        .message("Partial Content")
+                        .header("Content-Type", "video/mp4")
+                        .header("Content-Range", "bytes $start-$end/$largeSize")
+                        .header("Content-Length", slice.size.toString())
+                        .body(slice.toResponseBody("video/mp4".toMediaType()))
+                        .build()
+                } else {
+                    Response.Builder()
+                        .request(req)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(200)
+                        .message("OK")
+                        .header("Content-Type", "video/mp4")
+                        .header("Content-Length", largeSize.toString())
+                        .body(largeVideoBytes.toResponseBody("video/mp4".toMediaType()))
+                        .build()
                 }
             }
-            // Test 2: HTTP Range header
-            val reqRange = okhttp3.Request.Builder().url(baseCleanUrl).apply {
-                headers.forEach { (k, v) -> header(k, v) }
-                header("Range", "bytes=16777216-20971519")
-            }.build()
-            client.newCall(reqRange).execute().use { resp ->
-                val len = resp.body?.bytes()?.size ?: 0
-                println("HEADER_RANGE offset=16777216 code=${resp.code} read=$len cr=${resp.header("Content-Range")}")
-            }
+            .build()
+
+        val engine = DownloadEngine(
+            context = context,
+            dao = dao,
+            externalScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+            httpClient = rangeServerClient
+        )
+
+        val stream1080p = VideoStreamOption(
+            id = "yt_1080p_large",
+            resolutionLabel = "1080p FHD",
+            resolutionWidth = 1920,
+            resolutionHeight = 1080,
+            frameRate = 60,
+            isHdr = false,
+            container = VideoContainerFormat.MP4,
+            videoCodec = "H.264 (AVC1)",
+            audioCodec = "AAC-LC",
+            streamType = StreamType.PROGRESSIVE,
+            bitrateKbps = 4500,
+            estimatedSizeBytes = largeSize.toLong(),
+            downloadUrl = "https://rr2---sn-test.googlevideo.com/videoplayback?itag=22&clen=$largeSize&c=ANDROID_VR"
+        )
+        val meta = AnalyzedMediaMetadata(
+            sourceUrl = "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+            title = "Large 20MB 1080p Video",
+            authorOrDomain = "YouTube Creator",
+            platform = MediaPlatform.YOUTUBE,
+            durationMs = 35_000L,
+            thumbnailUrl = null,
+            supportsRangeRequests = true,
+            videoStreams = listOf(stream1080p),
+            audioStreams = emptyList(),
+            inspectionMethod = "Test"
+        )
+
+        val enqueued = engine.enqueueVideoDownload(meta, stream1080p, allowDuplicate = true)
+        assertTrue(enqueued is EnqueueResult.Enqueued)
+        val taskId = (enqueued as EnqueueResult.Enqueued).task.id
+
+        var task = dao.getTaskById(taskId)
+        val deadline = System.currentTimeMillis() + 12_000L
+        while (System.currentTimeMillis() < deadline && task?.statusEnum?.isActive == true) {
+            delay(50)
+            task = dao.getTaskById(taskId)
         }
+
+        assertNotNull(task)
+        assertEquals(
+            "Expected 20 MB download to complete past 16777216 bytes, but got: ${task?.errorMessage}",
+            DownloadStatus.COMPLETED,
+            task?.statusEnum
+        )
+        val outFile = File(task!!.outputFilePath)
+        assertTrue(outFile.exists())
+        assertEquals(largeSize.toLong(), outFile.length())
+        assertEquals(100, task.progressPercent)
+        assertTrue("Expected multi-chunk Range headers past 16MB", rangeRequestsSeen.size >= 5)
+
+        engine.deleteTaskAndFile(taskId)
+        db.close()
+    }
+
+    @Test
+    fun `slow downloads and mid-stream network interruptions automatically recover via HTTP Range resume to 100 percent`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val dao = db.downloadTaskDao()
+
+        val totalSize = 512 * 1024 // 512 KB
+        val fullPayload = ByteArray(totalSize) { idx -> ((idx * 29 + 13) and 0xFF).toByte() }
+        var attemptCounter = 0
+
+        // Simulate a flaky server that drops the TCP stream at 150 KB on attempt 1,
+        // drops again at 350 KB on attempt 2, and completes to 512 KB on attempt 3 via HTTP Range 206
+        val flakyNetworkClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                attemptCounter++
+                val req = chain.request()
+                val rangeHeader = req.header("Range").orEmpty()
+                val startOffset = if (rangeHeader.startsWith("bytes=")) {
+                    rangeHeader.removePrefix("bytes=").substringBefore('-').toIntOrNull() ?: 0
+                } else 0
+
+                val remaining = totalSize - startOffset
+                val cutoffBytes = when (attemptCounter) {
+                    1 -> 150 * 1024 // Drop after 150 KB
+                    2 -> 200 * 1024 // Drop after another 200 KB (at 350 KB total)
+                    else -> remaining // Deliver the rest
+                }
+
+                val droppingSource = object : okio.Source {
+                    private var pos = 0
+                    override fun read(sink: okio.Buffer, byteCount: Long): Long {
+                        if (pos >= cutoffBytes) {
+                            if (cutoffBytes < remaining) {
+                                throw java.io.EOFException("Simulated mid-stream network drop at byte ${startOffset + pos}")
+                            }
+                            return -1L
+                        }
+                        val toRead = minOf(byteCount.toInt(), cutoffBytes - pos, 16 * 1024)
+                        sink.write(fullPayload, startOffset + pos, toRead)
+                        pos += toRead
+                        return toRead.toLong()
+                    }
+                    override fun timeout(): okio.Timeout = okio.Timeout.NONE
+                    override fun close() {}
+                }
+
+                val body = object : okhttp3.ResponseBody() {
+                    override fun contentType() = "video/mp4".toMediaType()
+                    override fun contentLength() = remaining.toLong()
+                    override fun source() = droppingSource.buffer()
+                }
+
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(if (startOffset > 0) 206 else 200)
+                    .message(if (startOffset > 0) "Partial Content" else "OK")
+                    .header("Content-Type", "video/mp4")
+                    .header("Content-Length", remaining.toString())
+                    .apply {
+                        if (startOffset > 0) {
+                            header("Content-Range", "bytes $startOffset-${totalSize - 1}/$totalSize")
+                        }
+                    }
+                    .body(body)
+                    .build()
+            }
+            .build()
+
+        val engine = DownloadEngine(
+            context = context,
+            dao = dao,
+            externalScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+            httpClient = flakyNetworkClient
+        )
+
+        val stream = VideoStreamOption(
+            id = "flaky_720p",
+            resolutionLabel = "720p HD",
+            resolutionWidth = 1280,
+            resolutionHeight = 720,
+            frameRate = 30,
+            isHdr = false,
+            container = VideoContainerFormat.MP4,
+            videoCodec = "H.264",
+            audioCodec = "AAC",
+            streamType = StreamType.PROGRESSIVE,
+            bitrateKbps = 1500,
+            estimatedSizeBytes = totalSize.toLong(),
+            downloadUrl = "https://cdn.example.org/videos/flaky_stream.mp4"
+        )
+        val meta = AnalyzedMediaMetadata(
+            sourceUrl = "https://cdn.example.org/videos/flaky_stream.mp4",
+            title = "Flaky Network Video",
+            authorOrDomain = "cdn.example.org",
+            platform = MediaPlatform.DIRECT_URL,
+            durationMs = 12_000L,
+            thumbnailUrl = null,
+            supportsRangeRequests = true,
+            videoStreams = listOf(stream),
+            audioStreams = emptyList(),
+            inspectionMethod = "Test"
+        )
+
+        val enqueued = engine.enqueueVideoDownload(meta, stream, allowDuplicate = true)
+        assertTrue(enqueued is EnqueueResult.Enqueued)
+        val taskId = (enqueued as EnqueueResult.Enqueued).task.id
+
+        var finalTask = dao.getTaskById(taskId)
+        val deadline = System.currentTimeMillis() + 10_000L
+        while (System.currentTimeMillis() < deadline && finalTask?.statusEnum?.isActive == true) {
+            delay(50)
+            finalTask = dao.getTaskById(taskId)
+        }
+
+        assertNotNull(finalTask)
+        assertEquals(
+            "Expected interrupted stream to auto-resume via Range and complete, but got: ${finalTask?.errorMessage}",
+            DownloadStatus.COMPLETED,
+            finalTask?.statusEnum
+        )
+        assertTrue("Expected at least 3 attempts across network drops", attemptCounter >= 3)
+        val savedBytes = File(finalTask!!.outputFilePath).readBytes()
+        assertEquals(totalSize, savedBytes.size)
+        org.junit.Assert.assertArrayEquals("Resumed file bytes must match original payload byte-for-byte", fullPayload, savedBytes)
+
+        engine.deleteTaskAndFile(taskId)
+        db.close()
+    }
+
+    @Test
+    fun `expired URLs and HTTP 410 or 403 automatically switch to fallback stream or fail cleanly`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val dao = db.downloadTaskDao()
+
+        // Verify SocialStreamExtractor.isStreamUrlExpired detects expired timestamps
+        assertTrue(
+            com.example.data.platform.SocialStreamExtractor.isStreamUrlExpired(
+                "https://rr1---sn-test.googlevideo.com/videoplayback?expire=1600000000&itag=18",
+                nowEpochSeconds = 1700000000L
+            )
+        )
+        org.junit.Assert.assertFalse(
+            com.example.data.platform.SocialStreamExtractor.isStreamUrlExpired(
+                "https://rr1---sn-test.googlevideo.com/videoplayback?expire=1900000000&itag=18",
+                nowEpochSeconds = 1700000000L
+            )
+        )
+
+        val validBytes = ByteArray(16 * 1024) { ((it * 19 + 5) and 0xFF).toByte() }
+        val client = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                val url = req.url.toString()
+                if (url.contains("fresh_backup_720p.mp4")) {
+                    Response.Builder()
+                        .request(req)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(200)
+                        .message("OK")
+                        .header("Content-Type", "video/mp4")
+                        .header("Content-Length", validBytes.size.toString())
+                        .body(validBytes.toResponseBody("video/mp4".toMediaType()))
+                        .build()
+                } else {
+                    Response.Builder()
+                        .request(req)
+                        .protocol(Protocol.HTTP_1_1)
+                        .code(410)
+                        .message("Gone")
+                        .body("Gone".toResponseBody("text/plain".toMediaType()))
+                        .build()
+                }
+            }
+            .build()
+
+        val engine = DownloadEngine(
+            context = context,
+            dao = dao,
+            externalScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+            httpClient = client
+        )
+
+        val expiredStream = VideoStreamOption(
+            id = "expired_720p",
+            resolutionLabel = "720p HD",
+            resolutionWidth = 1280,
+            resolutionHeight = 720,
+            frameRate = 30,
+            isHdr = false,
+            container = VideoContainerFormat.MP4,
+            videoCodec = "H.264",
+            audioCodec = "AAC",
+            streamType = StreamType.PROGRESSIVE,
+            bitrateKbps = 1500,
+            estimatedSizeBytes = validBytes.size.toLong(),
+            downloadUrl = "https://cdn.example.org/expired_720p.mp4?expire=1500000000"
+        )
+        val backupStream = expiredStream.copy(
+            id = "backup_720p",
+            downloadUrl = "https://cdn.example.org/fresh_backup_720p.mp4?expire=4000000000"
+        )
+        val meta = AnalyzedMediaMetadata(
+            sourceUrl = "https://cdn.example.org/watch/123",
+            title = "Expired Link Recovery",
+            authorOrDomain = "cdn.example.org",
+            platform = MediaPlatform.DIRECT_URL,
+            durationMs = 8_000L,
+            thumbnailUrl = null,
+            supportsRangeRequests = true,
+            videoStreams = listOf(expiredStream, backupStream),
+            audioStreams = emptyList(),
+            inspectionMethod = "Test"
+        )
+
+        val enqueued = engine.enqueueVideoDownload(meta, expiredStream, allowDuplicate = true)
+        assertTrue(enqueued is EnqueueResult.Enqueued)
+        val taskId = (enqueued as EnqueueResult.Enqueued).task.id
+
+        var finalTask = dao.getTaskById(taskId)
+        val deadline = System.currentTimeMillis() + 6000L
+        while (System.currentTimeMillis() < deadline && finalTask?.statusEnum?.isActive == true) {
+            delay(50)
+            finalTask = dao.getTaskById(taskId)
+        }
+
+        assertNotNull(finalTask)
+        assertEquals(DownloadStatus.COMPLETED, finalTask?.statusEnum)
+        assertEquals(validBytes.size.toLong(), File(finalTask!!.outputFilePath).length())
+
+        engine.deleteTaskAndFile(taskId)
+        db.close()
+    }
+
+    @Test
+    fun `html json xml plain-text error responses and truncated partial MP4 files are rejected and never saved as completed videos`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val dao = db.downloadTaskDao()
+
+        val invalidScenarios = listOf(
+            // 1. JSON error returned with 200 OK and application/json
+            Triple("https://cdn.example.org/json_err.mp4", "application/json", """{"error":"Invalid token","code":403}""".toByteArray()),
+            // 2. JSON error disguised with video/mp4 Content-Type
+            Triple("https://cdn.example.org/disguised_json.mp4", "video/mp4", """{"status":"error","message":"Quota exceeded"}""".toByteArray()),
+            // 3. HTML login wall disguised with application/octet-stream
+            Triple("https://cdn.example.org/disguised_html.mp4", "application/octet-stream", "<!DOCTYPE html><html><body>Login required</body></html>".toByteArray()),
+            // 4. Plain-text error disguised with video/mp4
+            Triple("https://cdn.example.org/disguised_text.mp4", "video/mp4", "403 Forbidden: Access denied by CDN".toByteArray()),
+            // 5. Truncated MP4 container where mdat box header declares 500,000 bytes but file only has 200 bytes
+            Triple(
+                "https://cdn.example.org/truncated_box.mp4",
+                "video/mp4",
+                java.nio.ByteBuffer.allocate(64).apply {
+                    putInt(16)
+                    put("ftyp".toByteArray())
+                    put("isom".toByteArray())
+                    putInt(0)
+                    putInt(500_000) // Declared mdat size = 500 KB, but stream ends after 64 bytes!
+                    put("mdat".toByteArray())
+                }.array()
+            )
+        )
+
+        val rejectingClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                val url = req.url.toString()
+                val match = invalidScenarios.first { it.first == url }
+                Response.Builder()
+                    .request(req)
+                    .protocol(Protocol.HTTP_1_1)
+                    .code(200)
+                    .message("OK")
+                    .header("Content-Type", match.second)
+                    .header("Content-Length", match.third.size.toString())
+                    .body(match.third.toResponseBody(match.second.toMediaType()))
+                    .build()
+            }
+            .build()
+
+        val engine = DownloadEngine(
+            context = context,
+            dao = dao,
+            externalScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+            httpClient = rejectingClient
+        )
+
+        for ((idx, scenario) in invalidScenarios.withIndex()) {
+            val stream = VideoStreamOption(
+                id = "invalid_$idx",
+                resolutionLabel = "720p HD",
+                resolutionWidth = 1280,
+                resolutionHeight = 720,
+                frameRate = 30,
+                isHdr = false,
+                container = VideoContainerFormat.MP4,
+                videoCodec = "H.264",
+                audioCodec = "AAC",
+                streamType = StreamType.PROGRESSIVE,
+                bitrateKbps = 1000,
+                estimatedSizeBytes = scenario.third.size.toLong(),
+                downloadUrl = scenario.first
+            )
+            val meta = AnalyzedMediaMetadata(
+                sourceUrl = scenario.first,
+                title = "Invalid Scenario $idx",
+                authorOrDomain = "cdn.example.org",
+                platform = MediaPlatform.DIRECT_URL,
+                durationMs = 5_000L,
+                thumbnailUrl = null,
+                supportsRangeRequests = false,
+                videoStreams = listOf(stream),
+                audioStreams = emptyList(),
+                inspectionMethod = "Test"
+            )
+
+            val res = engine.enqueueVideoDownload(meta, stream, allowDuplicate = true)
+            assertTrue(res is EnqueueResult.Enqueued)
+            val taskId = (res as EnqueueResult.Enqueued).task.id
+
+            var task = dao.getTaskById(taskId)
+            val deadline = System.currentTimeMillis() + 4000L
+            while (System.currentTimeMillis() < deadline && task?.statusEnum?.isActive == true) {
+                delay(40)
+                task = dao.getTaskById(taskId)
+            }
+
+            assertNotNull(task)
+            assertEquals(
+                "Scenario $idx (${scenario.first}) must be rejected as FAILED, never COMPLETED",
+                DownloadStatus.FAILED,
+                task?.statusEnum
+            )
+            org.junit.Assert.assertFalse(
+                "Corrupt/non-media output file must not remain on disk for scenario $idx",
+                File(task!!.outputFilePath).exists()
+            )
+        }
+
+        db.close()
     }
 }
+

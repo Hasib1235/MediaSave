@@ -173,6 +173,190 @@ object MediaProcessorEngine {
         )
     }
 
+    /**
+     * Inspects an HTTP Content-Type and/or initial byte buffer to detect HTML, JSON, XML,
+     * or plain-text error responses disguised as media streams.
+     * Returns a non-null human-readable error description if the payload is invalid/non-media.
+     */
+    fun detectNonMediaErrorPayload(
+        headBytes: ByteArray,
+        bytesRead: Int,
+        contentType: String = ""
+    ): String? {
+        val ct = contentType.substringBefore(';').trim().lowercase()
+        if (ct.startsWith("text/html") || ct.startsWith("application/xhtml")) {
+            return "Server returned an HTML webpage ($ct) instead of a downloadable media file."
+        }
+        if (ct == "application/json" || ct == "application/problem+json" || ct.endsWith("+json")) {
+            return "Server returned a JSON response ($ct) instead of a downloadable media file."
+        }
+        if (ct == "text/plain" || ct == "text/xml" || ct == "application/xml") {
+            return "Server returned a text/XML error response ($ct) instead of a downloadable media file."
+        }
+
+        if (bytesRead <= 0) return null
+        val sampleLen = minOf(bytesRead, 512)
+        val preview = String(headBytes, 0, sampleLen, Charsets.UTF_8).trimStart()
+        val lower = preview.lowercase()
+
+        if (lower.startsWith("<!doctype html") ||
+            lower.startsWith("<html") ||
+            lower.startsWith("<head") ||
+            lower.startsWith("<body") ||
+            lower.startsWith("<script")
+        ) {
+            return "Downloaded response is an HTML webpage rather than a valid media container."
+        }
+        if (lower.startsWith("<?xml") || lower.startsWith("<error") || lower.startsWith("<rss")) {
+            return "Downloaded response is an XML payload rather than a valid media container."
+        }
+        if (lower.startsWith("{\"") ||
+            lower.startsWith("{\n") ||
+            lower.startsWith("{\r") ||
+            lower.startsWith("{ ") ||
+            lower.startsWith("[{")
+        ) {
+            return "Downloaded response is a JSON payload rather than a valid media container."
+        }
+        if (lower.startsWith("error:") ||
+            lower.startsWith("403 forbidden") ||
+            lower.startsWith("404 not found") ||
+            lower.startsWith("401 unauthorized") ||
+            lower.startsWith("410 gone") ||
+            lower.startsWith("access denied") ||
+            lower.startsWith("bad request") ||
+            lower.startsWith("rate limit")
+        ) {
+            return "Downloaded response is a plain-text server error message rather than a media file."
+        }
+        return null
+    }
+
+    /**
+     * Validates that a completed local media file is non-empty, is not an HTML/JSON/XML/text error response,
+     * and has an intact, non-truncated container structure.
+     */
+    suspend fun validateMediaFileIntegrity(
+        file: File,
+        expectedSizeBytes: Long = 0L
+    ): Result<InspectedFileMetadata> = withContext(Dispatchers.IO) {
+        if (!file.exists()) {
+            return@withContext Result.failure(IllegalStateException("Media file does not exist on disk."))
+        }
+        val actualLength = file.length()
+        if (actualLength <= 0L) {
+            return@withContext Result.failure(IllegalStateException("Media file is empty (0 bytes)."))
+        }
+        if (expectedSizeBytes > 0L && actualLength < expectedSizeBytes) {
+            return@withContext Result.failure(
+                IllegalStateException("Incomplete media file: expected $expectedSizeBytes bytes, but file has $actualLength bytes.")
+            )
+        }
+
+        val headLen = minOf(actualLength, 512L).toInt()
+        val headBytes = ByteArray(headLen)
+        RandomAccessFile(file, "r").use { raf ->
+            raf.readFully(headBytes)
+        }
+
+        detectNonMediaErrorPayload(headBytes, headLen)?.let { errMsg ->
+            return@withContext Result.failure(IllegalStateException(errMsg))
+        }
+
+        // If the file starts with an ISO BMFF ('ftyp') box, verify top-level boxes are not truncated
+        if (headLen >= 8 &&
+            headBytes[4] == 'f'.code.toByte() &&
+            headBytes[5] == 't'.code.toByte() &&
+            headBytes[6] == 'y'.code.toByte() &&
+            headBytes[7] == 'p'.code.toByte()
+        ) {
+            val isoError = validateIsoBmffBoxStructure(file)
+            if (isoError != null) {
+                return@withContext Result.failure(IllegalStateException(isoError))
+            }
+        }
+
+        // If the file starts with a RIFF WAVE header, verify declared RIFF chunk size matches file
+        if (headLen >= 12 &&
+            headBytes[0] == 'R'.code.toByte() &&
+            headBytes[1] == 'I'.code.toByte() &&
+            headBytes[2] == 'F'.code.toByte() &&
+            headBytes[3] == 'F'.code.toByte() &&
+            headBytes[8] == 'W'.code.toByte() &&
+            headBytes[9] == 'A'.code.toByte() &&
+            headBytes[10] == 'V'.code.toByte() &&
+            headBytes[11] == 'E'.code.toByte()
+        ) {
+            val riffDataSize = ByteBuffer.wrap(headBytes, 4, 4).order(ByteOrder.LITTLE_ENDIAN).int.toLong() and 0xFFFFFFFFL
+            if (riffDataSize + 8L > actualLength) {
+                return@withContext Result.failure(
+                    IllegalStateException("Truncated WAV file: RIFF header declares ${riffDataSize + 8L} bytes, but file has $actualLength bytes.")
+                )
+            }
+        }
+
+        val metadata = inspectMediaFile(file)
+        Result.success(metadata)
+    }
+
+    private fun validateIsoBmffBoxStructure(file: File): String? {
+        val totalLen = file.length()
+        if (totalLen < 16L) return "Truncated MP4/M4A container (${totalLen} bytes)."
+        return try {
+            RandomAccessFile(file, "r").use { raf ->
+                var offset = 0L
+                val header = ByteArray(16)
+                var hasMoovOrMoof = false
+                var hasMdat = false
+                var boxCount = 0
+
+                while (offset + 8L <= totalLen && boxCount < 100_000) {
+                    raf.seek(offset)
+                    val read = raf.read(header, 0, minOf(16, (totalLen - offset).toInt()))
+                    if (read < 8) break
+                    val buf = ByteBuffer.wrap(header, 0, read).order(ByteOrder.BIG_ENDIAN)
+                    val rawSize = buf.int.toLong() and 0xFFFFFFFFL
+                    val type = String(header, 4, 4, Charsets.US_ASCII)
+
+                    // Ensure box type is printable ASCII
+                    if (type.any { it.code !in 0x20..0x7E }) {
+                        break
+                    }
+
+                    val boxSize = when (rawSize) {
+                        0L -> totalLen - offset // box extends to EOF
+                        1L -> {
+                            if (read < 16) return "Truncated 64-bit ISO box header at byte $offset."
+                            buf.position(8)
+                            buf.long
+                        }
+                        else -> rawSize
+                    }
+
+                    if (boxSize < 8L) {
+                        return "Corrupted ISO box '$type' with invalid size $boxSize at byte $offset."
+                    }
+                    if (offset + boxSize > totalLen) {
+                        return "Truncated MP4/M4A container: box '$type' at byte $offset requires $boxSize bytes, but only ${totalLen - offset} bytes remain."
+                    }
+
+                    if (type == "moov" || type == "moof") hasMoovOrMoof = true
+                    if (type == "mdat") hasMdat = true
+                    offset += boxSize
+                    boxCount++
+                }
+
+                if (!hasMoovOrMoof && !hasMdat) {
+                    "Invalid MP4/M4A container: missing 'moov' and 'mdat' media atoms."
+                } else {
+                    null
+                }
+            }
+        } catch (e: Exception) {
+            "Failed to verify MP4/M4A container structure: ${e.localizedMessage}"
+        }
+    }
+
     fun readableCodecName(mime: String): String = when (mime.lowercase()) {
         MediaFormat.MIMETYPE_VIDEO_AVC, "video/avc" -> "H.264 (AVC1)"
         MediaFormat.MIMETYPE_VIDEO_HEVC, "video/hevc" -> "HEVC (H.265)"
@@ -204,9 +388,9 @@ object MediaProcessorEngine {
     }
 
     /**
-     * Lawfully merges a separate video stream and audio stream into a single playable MP4 container.
-     * On real Android devices with multi-sample H.264/AAC streams (e.g. YouTube 720p/1080p adaptive streams),
-     * uses native `MediaExtractor` + `MediaMuxer` (`MUXER_OUTPUT_MPEG_4`) for lossless sample-by-sample remuxing.
+     * Lawfully merges a separate video stream and audio stream into a single playable MP4/WebM container.
+     * On real Android devices with multi-sample H.264/AAC or VP9/Opus streams (e.g. YouTube 720p/1080p/1440p/4K adaptive streams),
+     * uses native `MediaExtractor` + `MediaMuxer` for lossless sample-by-sample remuxing.
      * In headless JVM/Robolectric unit tests or single-sample synthetic test files, falls back to deterministic
      * ISO Base Media File Format (`ftyp` + `moov` + `mdat`) assembly.
      */
@@ -232,7 +416,11 @@ object MediaProcessorEngine {
 
             if (outputFile.exists()) outputFile.delete()
 
-            // 2. Fallback for JVM Robolectric unit tests or synthetic single-sample files
+            // 2. Fallback for JVM Robolectric unit tests or synthetic single-sample files (< 2 MB)
+            if (videoFile.length() > 2L * 1024L * 1024L) {
+                return@withContext false
+            }
+
             val videoInfo = inspectMediaFile(videoFile)
             val width = videoInfo.width.takeIf { it > 0 } ?: 1920
             val height = videoInfo.height.takeIf { it > 0 } ?: 1080
@@ -247,6 +435,9 @@ object MediaProcessorEngine {
             }
 
             if (videoBytes.isEmpty()) {
+                return@withContext false
+            }
+            if (detectNonMediaErrorPayload(videoBytes, videoBytes.size) != null) {
                 return@withContext false
             }
 
@@ -264,12 +455,7 @@ object MediaProcessorEngine {
             )
             return@withContext outputFile.exists() && outputFile.length() > 0L
         } catch (_: Exception) {
-            runCatching {
-                if (!outputFile.exists() || outputFile.length() == 0L) {
-                    videoFile.copyTo(outputFile, overwrite = true)
-                }
-            }
-            return@withContext outputFile.exists() && outputFile.length() > 0L
+            return@withContext false
         }
     }
 
@@ -286,25 +472,32 @@ object MediaProcessorEngine {
             videoExtractor = MediaExtractor().apply { setDataSource(videoFile.absolutePath) }
             var videoTrackIndex = -1
             var videoFormat: MediaFormat? = null
+            var videoMime = ""
             for (i in 0 until videoExtractor.trackCount) {
                 val fmt = videoExtractor.getTrackFormat(i)
                 val mime = fmt.getString(MediaFormat.KEY_MIME).orEmpty()
                 if (mime.startsWith("video/")) {
                     videoTrackIndex = i
                     videoFormat = fmt
+                    videoMime = mime.lowercase()
                     break
                 }
             }
             if (videoTrackIndex == -1 || videoFormat == null) return false
             videoExtractor.selectTrack(videoTrackIndex)
 
-            // Verify the video track has at least 2 real samples (skip single-sample synthetic test files)
-            val probeBuf = ByteBuffer.allocate(64 * 1024)
-            val firstSize = videoExtractor.readSampleData(probeBuf, 0)
+            // Allocate a 2 MB direct buffer so 1080p/1440p/4K IDR keyframes never overflow during probing or remuxing
+            val buffer = ByteBuffer.allocateDirect(2 * 1024 * 1024)
+            val firstSize = videoExtractor.readSampleData(buffer, 0)
             if (firstSize <= 0) return false
-            val hasSecondSample = videoExtractor.advance() && videoExtractor.readSampleData(probeBuf, 0) > 0
+            buffer.clear()
+            val hasSecondSample = videoExtractor.advance() && videoExtractor.readSampleData(buffer, 0) > 0
             if (!hasSecondSample) return false
             videoExtractor.seekTo(0L, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+
+            val useWebmMuxer = outputFile.extension.equals("webm", ignoreCase = true) ||
+                videoMime.contains("vp9") ||
+                videoMime.contains("vp8")
 
             var audioTrackIndex = -1
             var audioFormat: MediaFormat? = null
@@ -312,8 +505,13 @@ object MediaProcessorEngine {
                 audioExtractor = MediaExtractor().apply { setDataSource(audioFile.absolutePath) }
                 for (i in 0 until audioExtractor.trackCount) {
                     val fmt = audioExtractor.getTrackFormat(i)
-                    val mime = fmt.getString(MediaFormat.KEY_MIME).orEmpty()
-                    if (mime.startsWith("audio/mp4a") || mime == MediaFormat.MIMETYPE_AUDIO_AAC) {
+                    val mime = fmt.getString(MediaFormat.KEY_MIME).orEmpty().lowercase()
+                    val compatibleAudio = if (useWebmMuxer) {
+                        mime.contains("opus") || mime.contains("vorbis")
+                    } else {
+                        mime.startsWith("audio/mp4a") || mime == MediaFormat.MIMETYPE_AUDIO_AAC.lowercase()
+                    }
+                    if (compatibleAudio) {
                         audioTrackIndex = i
                         audioFormat = fmt
                         break
@@ -324,7 +522,12 @@ object MediaProcessorEngine {
                 }
             }
 
-            muxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            val muxerOutputFormat = if (useWebmMuxer) {
+                MediaMuxer.OutputFormat.MUXER_OUTPUT_WEBM
+            } else {
+                MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
+            }
+            muxer = MediaMuxer(outputFile.absolutePath, muxerOutputFormat)
             val muxVideoTrack = muxer.addTrack(videoFormat)
             val muxAudioTrack = if (audioTrackIndex != -1 && audioFormat != null) {
                 runCatching { muxer.addTrack(audioFormat) }.getOrDefault(-1)
@@ -333,7 +536,6 @@ object MediaProcessorEngine {
             muxer.start()
             muxerStarted = true
 
-            val buffer = ByteBuffer.allocateDirect(1024 * 1024)
             val bufferInfo = MediaCodec.BufferInfo()
 
             // Write all video samples with monotonic presentationTimeUs

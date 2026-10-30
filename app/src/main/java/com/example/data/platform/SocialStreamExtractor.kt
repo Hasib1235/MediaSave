@@ -586,6 +586,33 @@ object SocialStreamExtractor {
         }
     }
 
+    /**
+     * Checks whether a signed CDN stream URL (such as googlevideo.com `expire=`, TikTok `x-expires=`,
+     * or Facebook/Instagram `oe=` hex timestamp) has already expired.
+     */
+    fun isStreamUrlExpired(
+        url: String,
+        nowEpochSeconds: Long = System.currentTimeMillis() / 1000L
+    ): Boolean {
+        val cleanUrl = stripUrlFragment(url)
+        val decMatch = Regex("[?&](?:expire|x-expires|expires)=(\\d{9,13})(?:&|$)", RegexOption.IGNORE_CASE)
+            .find(cleanUrl)?.groupValues?.getOrNull(1)?.toLongOrNull()
+        if (decMatch != null) {
+            val expirySec = if (decMatch > 10_000_000_000L) decMatch / 1000L else decMatch
+            if (expirySec in 946_684_800L..4_102_444_800L && expirySec <= nowEpochSeconds + 10L) {
+                return true
+            }
+        }
+        val hexOeMatch = Regex("[?&]oe=([0-9a-fA-F]{8})(?:&|$)")
+            .find(cleanUrl)?.groupValues?.getOrNull(1)?.toLongOrNull(16)
+        if (hexOeMatch != null) {
+            if (hexOeMatch in 946_684_800L..4_102_444_800L && hexOeMatch <= nowEpochSeconds + 10L) {
+                return true
+            }
+        }
+        return false
+    }
+
     private fun verifyAndFilterYouTubeStreams(
         @Suppress("UNUSED_PARAMETER") httpClient: OkHttpClient,
         extracted: ExtractedSocialStreams,
@@ -944,6 +971,10 @@ object SocialStreamExtractor {
             .maxByOrNull { it.bitrateKbps }
             ?: audioStreams.firstOrNull { !it.isExtractedFromVideo }
             ?: audioStreams.firstOrNull()
+        val bestWebmAudio = audioStreams
+            .filter { it.sourceFormat == AudioFormat.OPUS && !it.isExtractedFromVideo }
+            .maxByOrNull { it.bitrateKbps }
+            ?: bestM4aAudio
 
         for (i in 0 until adaptiveFormats.length()) {
             val item = adaptiveFormats.optJSONObject(i) ?: continue
@@ -961,11 +992,14 @@ object SocialStreamExtractor {
             val isVp9 = mimeRaw.contains("vp9") || mimeRaw.contains("vp09")
             val isWebm = mimeRaw.contains("webm")
 
-            // Deduplicate by height: prefer AVC1 (MP4) for maximum compatibility, but keep highest resolutions
+            // Deduplicate by height: keep PROGRESSIVE if already present, and among adaptive prefer H.264 (AVC1) MP4
             val existingIndex = videoStreams.indexOfFirst { it.resolutionHeight == height }
             if (existingIndex >= 0) {
                 val existing = videoStreams[existingIndex]
-                if (existing.container == VideoContainerFormat.WEBM && isMp4 && isAvc) {
+                if (existing.streamType != StreamType.PROGRESSIVE &&
+                    !existing.videoCodec.contains("H.264") &&
+                    isMp4 && isAvc
+                ) {
                     videoStreams.removeAt(existingIndex)
                 } else {
                     continue
@@ -986,6 +1020,7 @@ object SocialStreamExtractor {
                 else -> "WebM Video"
             }
             val containerFmt = if (isWebm) VideoContainerFormat.WEBM else VideoContainerFormat.MP4
+            val pairedAudio = if (isWebm) bestWebmAudio else bestM4aAudio
 
             videoStreams.add(
                 VideoStreamOption(
@@ -994,16 +1029,16 @@ object SocialStreamExtractor {
                     resolutionWidth = width,
                     resolutionLabel = MediaProcessorEngine.resolutionLabelForHeight(width, height),
                     videoCodec = codecLabel,
-                    audioCodec = if (bestM4aAudio != null) null else "AAC-LC",
+                    audioCodec = if (pairedAudio != null) null else "AAC-LC",
                     container = containerFmt,
-                    streamType = if (bestM4aAudio != null) StreamType.VIDEO_ONLY else StreamType.PROGRESSIVE,
+                    streamType = if (pairedAudio != null) StreamType.VIDEO_ONLY else StreamType.PROGRESSIVE,
                     frameRate = fps,
                     isHdr = item.optString("qualityLabel").contains("HDR", ignoreCase = true),
                     bitrateKbps = bitrateKbps,
                     estimatedSizeBytes = contentLen,
                     downloadUrl = streamUrl,
-                    pairedAudioStreamUrl = bestM4aAudio?.downloadUrl,
-                    pairedAudioSizeBytes = bestM4aAudio?.estimatedSizeBytes ?: 0L
+                    pairedAudioStreamUrl = pairedAudio?.downloadUrl,
+                    pairedAudioSizeBytes = pairedAudio?.estimatedSizeBytes ?: 0L
                 )
             )
         }
