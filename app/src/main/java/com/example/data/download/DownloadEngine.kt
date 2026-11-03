@@ -1184,11 +1184,16 @@ class DownloadEngine(
         val googleChunkWindow = 4L * 1024L * 1024L // 4 MB HTTP Range window for googlevideo.com
         var consecutiveFailures = 0
         var activeRecoveryDepth = recoveryDepth
+        var refreshProgressAnchor = currentOffset
 
         while (true) {
             currentCoroutineContext().ensureActive()
             if (pausedOrCancelledTasks.containsKey(taskId)) {
                 throw CancellationException("Task paused or cancelled")
+            }
+            if (currentOffset > refreshProgressAnchor) {
+                activeRecoveryDepth = recoveryDepth
+                refreshProgressAnchor = currentOffset
             }
 
             val host = runCatching { URI(cleanUrl).host?.lowercase() }.getOrNull().orEmpty()
@@ -1530,7 +1535,7 @@ class DownloadEngine(
 
         val queuedFallbacks = taskFallbackUrls[taskId].orEmpty()
         val nextQueuedFallback = queuedFallbacks.firstOrNull {
-            SocialStreamExtractor.stripUrlFragment(it) != cleanFailedUrl &&
+            normalizeStreamUrl(it) != cleanFailedUrl &&
                 !SocialStreamExtractor.isStreamUrlExpired(it)
         }
         if (nextQueuedFallback != null) {
@@ -1549,7 +1554,7 @@ class DownloadEngine(
             isAudio = currentTask?.mode == DownloaderMode.MUSIC.name || baseByteOffset > 0L,
             preferredHeight = currentTask?.height ?: 720
         )
-        if (!freshUrl.isNullOrBlank() && SocialStreamExtractor.stripUrlFragment(freshUrl) != cleanFailedUrl) {
+        if (!freshUrl.isNullOrBlank() && normalizeStreamUrl(freshUrl) != cleanFailedUrl) {
             if (currentTask != null) {
                 if (baseByteOffset == 0L) {
                     dao.upsertTask(currentTask.copy(sourceUrl = freshUrl))

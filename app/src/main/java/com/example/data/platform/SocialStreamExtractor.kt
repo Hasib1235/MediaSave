@@ -1385,6 +1385,18 @@ object SocialStreamExtractor {
      * Automatically resolves a fresh, non-403 stream URL when a previously extracted CDN link
      * expires or returns HTTP 401/403/410 during download execution.
      */
+    private fun normalizeComparableStreamUrl(rawUrl: String): String {
+        val stripped = stripUrlFragment(rawUrl)
+        return if (stripped.contains("googlevideo.com/videoplayback")) {
+            stripped.replace(Regex("([?&])range=[^&]+"), "$1")
+                .replace("?&", "?")
+                .replace("&&", "&")
+                .trimEnd('?', '&')
+        } else {
+            stripped
+        }
+    }
+
     fun resolveFreshStreamUrlOn403(
         httpClient: OkHttpClient,
         failedUrl: String,
@@ -1393,14 +1405,18 @@ object SocialStreamExtractor {
         isAudio: Boolean,
         preferredHeight: Int
     ): String? {
-        val cleanFailed = stripUrlFragment(failedUrl)
+        val cleanFailed = normalizeComparableStreamUrl(failedUrl)
 
         // 1. Check if the failed URL has an embedded fallback stream (#fb=...) or TikTok ID (#ttid=...)
         val fragment = failedUrl.substringAfter('#', "")
         if (fragment.contains("fb=")) {
             val rawFb = fragment.substringAfter("fb=").substringBefore('&')
             val decodedFb = runCatching { URLDecoder.decode(rawFb, "UTF-8") }.getOrDefault(rawFb).trim()
-            if (decodedFb.startsWith("http") && stripUrlFragment(decodedFb) != cleanFailed) {
+            if (decodedFb.startsWith("http") &&
+                normalizeComparableStreamUrl(decodedFb) != cleanFailed &&
+                !isStreamUrlExpired(decodedFb) &&
+                isStreamUrlDownloadable(httpClient, decodedFb)
+            ) {
                 return decodedFb
             }
         }
@@ -1423,8 +1439,8 @@ object SocialStreamExtractor {
                 )
             }
             for (cand in tikwmCandidates) {
-                if (cand != cleanFailed && isStreamUrlDownloadable(httpClient, cand)) {
-                    return cand
+                if (normalizeComparableStreamUrl(cand) != cleanFailed && isStreamUrlDownloadable(httpClient, cand)) {
+                    return appendTikTokIdFragment(cand, tikTokId)
                 }
             }
             val refreshedTikTok = extractTikTokStreams(
@@ -1440,8 +1456,8 @@ object SocialStreamExtractor {
                 }
                 for (cand in apiCandidates) {
                     val cleanCand = stripUrlFragment(cand)
-                    if (cleanCand != cleanFailed && isStreamUrlDownloadable(httpClient, cleanCand)) {
-                        return cleanCand
+                    if (normalizeComparableStreamUrl(cleanCand) != cleanFailed && isStreamUrlDownloadable(httpClient, cleanCand)) {
+                        return appendTikTokIdFragment(cleanCand, tikTokId)
                     }
                 }
             }
@@ -1455,28 +1471,35 @@ object SocialStreamExtractor {
         }
         val queryYtId = Regex("[?&]id=([a-zA-Z0-9_-]{11})(?:&|$)").find(cleanFailed)?.groupValues?.getOrNull(1)
         val youtubeVideoId = fragmentYtId ?: originYtId ?: thumbYtId ?: queryYtId
+        val failedItag = Regex("[?&]itag=(\\d+)(?:&|$)").find(cleanFailed)?.groupValues?.getOrNull(1)
 
         if (!youtubeVideoId.isNullOrBlank()) {
-            // Try InnerTube clients without web visitorData first, then with pageCtx
+            // Try InnerTube clients without web visitorData first
             for (profile in INNERTUBE_CLIENTS) {
                 if (profile.isEmbedded) continue
                 val raw = tryInnerTubeProfile(httpClient, youtubeVideoId, profile, null, null) ?: continue
-                val candidates = if (isAudio) {
+                val rawCandidates = if (isAudio) {
                     raw.audioStreams.map { it.downloadUrl } + raw.videoStreams.map { it.downloadUrl }
                 } else {
                     val exactHeight = raw.videoStreams.filter { it.resolutionHeight == preferredHeight }.map { it.downloadUrl }
                     val nearHeight = raw.videoStreams.sortedBy { kotlin.math.abs(it.resolutionHeight - preferredHeight) }.map { it.downloadUrl }
                     (exactHeight + nearHeight).distinct()
                 }
+                val candidates = if (!failedItag.isNullOrBlank()) {
+                    val matchingItag = rawCandidates.filter { it.contains("itag=$failedItag&") || it.endsWith("itag=$failedItag") }
+                    (matchingItag + rawCandidates).distinct()
+                } else {
+                    rawCandidates
+                }
                 for (candidate in candidates) {
                     val cleanCandidate = stripUrlFragment(candidate)
-                    if (cleanCandidate != cleanFailed && isStreamUrlDownloadable(httpClient, cleanCandidate)) {
-                        return cleanCandidate
+                    if (normalizeComparableStreamUrl(cleanCandidate) != cleanFailed && isStreamUrlDownloadable(httpClient, cleanCandidate)) {
+                        return appendVideoIdFragment(cleanCandidate, youtubeVideoId)
                     }
                 }
             }
 
-            // Try Piped proxy streams next (already verified by extractYouTubeViaPiped)
+            // Try Piped proxy streams next
             extractYouTubeViaPiped(httpClient, youtubeVideoId)?.let { piped ->
                 val candidate = if (isAudio) {
                     piped.audioStreams.firstOrNull()?.downloadUrl
@@ -1485,8 +1508,11 @@ object SocialStreamExtractor {
                         ?: piped.videoStreams.minByOrNull { kotlin.math.abs(it.resolutionHeight - preferredHeight) }?.downloadUrl
                         ?: piped.videoStreams.firstOrNull()?.downloadUrl
                 }?.let(::stripUrlFragment)
-                if (!candidate.isNullOrBlank() && candidate != cleanFailed) {
-                    return candidate
+                if (!candidate.isNullOrBlank() &&
+                    normalizeComparableStreamUrl(candidate) != cleanFailed &&
+                    isStreamUrlDownloadable(httpClient, candidate)
+                ) {
+                    return appendVideoIdFragment(candidate, youtubeVideoId)
                 }
             }
 
@@ -1499,8 +1525,11 @@ object SocialStreamExtractor {
                         ?: inv.videoStreams.minByOrNull { kotlin.math.abs(it.resolutionHeight - preferredHeight) }?.downloadUrl
                         ?: inv.videoStreams.firstOrNull()?.downloadUrl
                 })?.let(::stripUrlFragment)
-                if (!candidate.isNullOrBlank() && candidate != cleanFailed && isStreamUrlDownloadable(httpClient, candidate)) {
-                    return candidate
+                if (!candidate.isNullOrBlank() &&
+                    normalizeComparableStreamUrl(candidate) != cleanFailed &&
+                    isStreamUrlDownloadable(httpClient, candidate)
+                ) {
+                    return appendVideoIdFragment(candidate, youtubeVideoId)
                 }
             }
         }
@@ -1523,8 +1552,11 @@ object SocialStreamExtractor {
                 }
                 for (candidate in candidates) {
                     val cleanCandidate = stripUrlFragment(candidate)
-                    if (cleanCandidate != cleanFailed) {
-                        return cleanCandidate
+                    if (normalizeComparableStreamUrl(cleanCandidate) != cleanFailed &&
+                        !isStreamUrlExpired(cleanCandidate) &&
+                        isStreamUrlDownloadable(httpClient, cleanCandidate)
+                    ) {
+                        return candidate
                     }
                 }
             }
