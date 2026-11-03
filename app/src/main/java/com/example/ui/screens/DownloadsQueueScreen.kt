@@ -57,6 +57,7 @@ import com.example.data.download.DownloadEngine
 import com.example.domain.model.DownloadStatus
 import com.example.domain.model.DownloadTaskEntity
 import com.example.domain.model.DownloaderMode
+import com.example.ui.components.ExpandableTechnicalDetailsSection
 import com.example.ui.components.MediaThumbnailArtwork
 import com.example.ui.theme.CoralError
 import com.example.ui.theme.MidnightBorder
@@ -334,6 +335,13 @@ private fun Screen6DownloadingProgressView(
                             )
                         }
 
+                        if (activeTask.statusEnum == DownloadStatus.FAILED && !activeTask.technicalDetails.isNullOrBlank()) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            ExpandableTechnicalDetailsSection(
+                                technicalDetails = activeTask.technicalDetails
+                            )
+                        }
+
                         Spacer(modifier = Modifier.height(18.dp))
 
                         // 3 Circular Control Buttons: Pause/Resume/Retry | Cancel | Background
@@ -567,6 +575,12 @@ private fun Screen6DownloadingProgressView(
                                     style = MaterialTheme.typography.labelSmall,
                                     color = if (qTask.statusEnum == DownloadStatus.FAILED) CoralError else TextSecondaryDark
                                 )
+                                if (qTask.statusEnum == DownloadStatus.FAILED && !qTask.technicalDetails.isNullOrBlank()) {
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    ExpandableTechnicalDetailsSection(
+                                        technicalDetails = qTask.technicalDetails
+                                    )
+                                }
                             }
                             Box {
                                 IconButton(onClick = { itemMenuExpanded = true }) {
@@ -842,6 +856,12 @@ private fun DownloadsLibraryVideoCard(
                     style = MaterialTheme.typography.labelSmall,
                     color = if (task.statusEnum == DownloadStatus.FAILED) CoralError else TextSecondaryDark.copy(alpha = 0.85f)
                 )
+                if (task.statusEnum == DownloadStatus.FAILED && !task.technicalDetails.isNullOrBlank()) {
+                    Spacer(modifier = Modifier.height(4.dp))
+                    ExpandableTechnicalDetailsSection(
+                        technicalDetails = task.technicalDetails
+                    )
+                }
             }
 
             Box {

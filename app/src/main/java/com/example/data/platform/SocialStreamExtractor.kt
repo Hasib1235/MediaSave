@@ -427,6 +427,70 @@ object SocialStreamExtractor {
         return lastSeg
     }
 
+    const val EXTRACTOR_ENGINE_VERSION =
+        "MediaSave Stream Engine v2.5 (InnerTube ANDROID_VR/TVHTML5 + Piped/Invidious + MediaMuxer)"
+
+    private val extractionLogs = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedDeque<String>>()
+    private val lastPlayabilityReasons = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    fun recordDiagnostic(key: String, message: String) {
+        val normKey = extractYouTubeVideoId(key) ?: stripUrlFragment(key).take(120)
+        val deque = extractionLogs.getOrPut(normKey) { java.util.concurrent.ConcurrentLinkedDeque() }
+        val ts = java.text.SimpleDateFormat("HH:mm:ss.SSS", java.util.Locale.US).format(java.util.Date())
+        deque.addLast("[$ts] $message")
+        while (deque.size > 40) {
+            deque.pollFirst()
+        }
+    }
+
+    fun getDiagnosticLog(key: String): List<String> {
+        val normKey = extractYouTubeVideoId(key) ?: stripUrlFragment(key).take(120)
+        return extractionLogs[normKey]?.toList().orEmpty()
+    }
+
+    fun getLastPlayabilityReason(videoIdOrUrl: String): String? {
+        val ytId = extractYouTubeVideoId(videoIdOrUrl) ?: videoIdOrUrl
+        return lastPlayabilityReasons[ytId]
+    }
+
+    fun mapYouTubeFailureMessage(rawReasonOrError: String?, videoIdOrUrl: String? = null): Pair<String, String> {
+        val playabilityReason = videoIdOrUrl?.let { getLastPlayabilityReason(it) }.orEmpty()
+        val combined = "${rawReasonOrError.orEmpty()} $playabilityReason".trim()
+        val lower = combined.lowercase()
+        return when {
+            lower.contains("not a bot") ||
+                lower.contains("sign in to confirm") ||
+                lower.contains("blocking this server") ||
+                lower.contains("http 403") ||
+                lower.contains("403") -> {
+                "YouTube IP / Session Blocked (HTTP 403)" to
+                    "YouTube is blocking this server's IP address or rejected the session token (HTTP 403)."
+            }
+            lower.contains("private video") ||
+                lower.contains("video unavailable") ||
+                lower.contains("members-only") ||
+                lower.contains("This video is not available".lowercase()) ||
+                lower.contains("removed by the uploader") -> {
+                "Video Unavailable or Private" to
+                    "This YouTube video is private, members-only, or unavailable."
+            }
+            lower.contains("age") && lower.contains("restrict") -> {
+                "Age-Restricted Video" to
+                    "This YouTube video is age-restricted and requires authentication."
+            }
+            lower.contains("requested format is not available") ||
+                lower.contains("format is not available") -> {
+                "Format Not Available" to
+                    "The requested stream format was unavailable on YouTube."
+            }
+            else -> {
+                "YouTube Stream Error" to
+                    (rawReasonOrError?.takeIf { it.isNotBlank() }
+                        ?: "Could not extract or download playable streams for this YouTube video.")
+            }
+        }
+    }
+
     private data class YouTubePageContext(
         val visitorData: String? = null,
         val signatureTimestamp: Int? = null
@@ -459,34 +523,15 @@ object SocialStreamExtractor {
             deviceModel = "Quest 3"
         ),
         InnerTubeClientProfile(
-            clientName = "IOS",
-            clientVersion = "20.03.02",
-            clientIdHeader = "5",
-            userAgent = "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)",
-            osName = "iPhone",
-            osVersion = "18.2.1.22C161",
-            deviceMake = "Apple",
-            deviceModel = "iPhone16,2"
-        ),
-        InnerTubeClientProfile(
-            clientName = "ANDROID_TESTSUITE",
-            clientVersion = "1.9",
-            clientIdHeader = "30",
-            userAgent = "com.google.android.youtube/1.9 (Linux; U; Android 12; en_US) gzip",
+            clientName = "ANDROID_VR",
+            clientVersion = "1.61.48",
+            clientIdHeader = "28",
+            userAgent = "com.google.android.apps.youtube.vr.oculus/1.61.48 (Linux; U; Android 12L; en_US; eureka-user Build/SQ3A.220605.009.A1) gzip",
             osName = "Android",
-            osVersion = "12",
-            androidSdkVersion = 31,
-            playerParams = "CgIQBg=="
-        ),
-        InnerTubeClientProfile(
-            clientName = "ANDROID",
-            clientVersion = "20.03.35",
-            clientIdHeader = "3",
-            userAgent = "com.google.android.youtube/20.03.35 (Linux; U; Android 14; en_US) gzip",
-            osName = "Android",
-            osVersion = "14",
-            androidSdkVersion = 34,
-            playerParams = "CgIQBg=="
+            osVersion = "12L",
+            androidSdkVersion = 32,
+            deviceMake = "Oculus",
+            deviceModel = "Quest 3"
         ),
         InnerTubeClientProfile(
             clientName = "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
@@ -496,6 +541,17 @@ object SocialStreamExtractor {
             osName = "PlayStation",
             osVersion = "12.00",
             isEmbedded = true
+        ),
+        InnerTubeClientProfile(
+            clientName = "ANDROID_CREATOR",
+            clientVersion = "23.47.101",
+            clientIdHeader = "14",
+            userAgent = "com.google.android.apps.youtube.creator/23.47.101 (Linux; U; Android 14; en_US; Pixel 8 Build/UQ1A.240205.004) gzip",
+            osName = "Android",
+            osVersion = "14",
+            androidSdkVersion = 34,
+            deviceMake = "Google",
+            deviceModel = "Pixel 8"
         )
     )
 
@@ -509,16 +565,20 @@ object SocialStreamExtractor {
         val headers = LinkedHashMap<String, String>()
 
         val userAgent = when {
-            isDirectGoogleVideo && lowerUrl.contains("c=ios") ->
-                "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)"
             isDirectGoogleVideo && lowerUrl.contains("c=android_vr") ->
                 "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; en_US; eureka-user Build/SQ3A.220605.009.A1) gzip"
+            isDirectGoogleVideo && lowerUrl.contains("c=android_creator") ->
+                "com.google.android.apps.youtube.creator/23.47.101 (Linux; U; Android 14; en_US; Pixel 8 Build/UQ1A.240205.004) gzip"
+            isDirectGoogleVideo && lowerUrl.contains("c=ios") ->
+                "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)"
             isDirectGoogleVideo && lowerUrl.contains("c=android_testsuite") ->
                 "com.google.android.youtube/1.9 (Linux; U; Android 12; en_US) gzip"
             isDirectGoogleVideo && lowerUrl.contains("c=android") ->
                 "com.google.android.youtube/20.03.35 (Linux; U; Android 14; en_US) gzip"
             isDirectGoogleVideo && lowerUrl.contains("c=tvhtml5") ->
                 "Mozilla/5.0 (PlayStation; PlayStation 4/12.00) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.4 Safari/605.1.15"
+            isDirectGoogleVideo ->
+                "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; en_US; eureka-user Build/SQ3A.220605.009.A1) gzip"
             host.contains("facebook") || host.contains("fbcdn") || host.contains("fbsbx") ->
                 DESKTOP_USER_AGENT
             host.contains("instagram") || host.contains("cdninstagram") || host.contains("ddinstagram") ->
@@ -553,23 +613,17 @@ object SocialStreamExtractor {
 
     /**
      * Probes the first 1 KB of a candidate media stream URL when recovering from an HTTP 403 error.
-     * Note: Never call this during initial `Analyze`, as aborting a stream probe burns single-use CDN tokens.
+     * Uses only the HTTP `Range: bytes=0-1023` header (never duplicating `?range=` query params).
      */
     fun isStreamUrlDownloadable(httpClient: OkHttpClient, streamUrl: String): Boolean {
-        val cleanUrl = stripUrlFragment(streamUrl)
+        val cleanUrl = normalizeComparableStreamUrl(streamUrl)
         if (cleanUrl.startsWith("file:", ignoreCase = true)) return true
         if (!cleanUrl.startsWith("http://", ignoreCase = true) && !cleanUrl.startsWith("https://", ignoreCase = true)) {
             return false
         }
         return try {
-            val testUrl = if (cleanUrl.contains("googlevideo.com") && !cleanUrl.contains("range=")) {
-                val sep = if (cleanUrl.contains("?")) "&" else "?"
-                "${cleanUrl}${sep}range=0-1023"
-            } else {
-                cleanUrl
-            }
-            val reqBuilder = Request.Builder().url(testUrl).get()
-            for ((k, v) in buildStreamRequestHeaders(testUrl)) {
+            val reqBuilder = Request.Builder().url(cleanUrl).get()
+            for ((k, v) in buildStreamRequestHeaders(cleanUrl)) {
                 reqBuilder.header(k, v)
             }
             reqBuilder.header("Range", "bytes=0-1023")
@@ -723,9 +777,10 @@ object SocialStreamExtractor {
     }
 
     fun extractYouTubeViaInnerTube(httpClient: OkHttpClient, videoId: String): ExtractedSocialStreams? {
-        // Pass 1: Try native mobile/VR InnerTube clients WITHOUT web visitorData first.
-        // Passing web embed visitorData to ANDROID_VR / IOS triggers LOGIN_REQUIRED on YouTube,
-        // whereas clean native client requests return all progressive + adaptive streams directly.
+        recordDiagnostic(videoId, "Starting InnerTube extraction for videoId=$videoId")
+        // Pass 1: Try native VR/Creator InnerTube clients WITHOUT web visitorData first.
+        // Passing web embed visitorData to ANDROID_VR triggers LOGIN_REQUIRED on YouTube,
+        // whereas clean native client requests return progressive + adaptive streams directly.
         for (profile in INNERTUBE_CLIENTS) {
             if (profile.isEmbedded) continue
             val rawResult = tryInnerTubeProfile(
@@ -738,13 +793,21 @@ object SocialStreamExtractor {
             if (rawResult != null) {
                 val verified = verifyAndFilterYouTubeStreams(httpClient, rawResult, videoId)
                 if (verified != null && (verified.videoStreams.isNotEmpty() || verified.audioStreams.isNotEmpty())) {
+                    recordDiagnostic(
+                        videoId,
+                        "InnerTube ${profile.clientName}/${profile.clientVersion} succeeded: ${verified.videoStreams.size} video, ${verified.audioStreams.size} audio streams"
+                    )
                     return verified
                 }
             }
         }
 
-        // Pass 2: Fallback with embed page visitorData & signatureTimestamp
+        // Pass 2: Fallback with embed page visitorData & signatureTimestamp (especially for TVHTML5_SIMPLY_EMBEDDED_PLAYER)
         val pageCtx = fetchYouTubePageContext(httpClient, videoId)
+        recordDiagnostic(
+            videoId,
+            "Fetched embed context: sts=${pageCtx.signatureTimestamp ?: "none"}, visitorData=${if (pageCtx.visitorData.isNullOrBlank()) "none" else "present"}"
+        )
         for (profile in INNERTUBE_CLIENTS) {
             val rawResult = tryInnerTubeProfile(
                 httpClient = httpClient,
@@ -756,10 +819,15 @@ object SocialStreamExtractor {
             if (rawResult != null) {
                 val verified = verifyAndFilterYouTubeStreams(httpClient, rawResult, videoId)
                 if (verified != null && (verified.videoStreams.isNotEmpty() || verified.audioStreams.isNotEmpty())) {
+                    recordDiagnostic(
+                        videoId,
+                        "InnerTube ${profile.clientName}/${profile.clientVersion} (with embed sts) succeeded: ${verified.videoStreams.size} video, ${verified.audioStreams.size} audio streams"
+                    )
                     return verified
                 }
             }
         }
+        recordDiagnostic(videoId, "All InnerTube profiles exhausted for videoId=$videoId")
         return null
     }
 
@@ -843,21 +911,42 @@ object SocialStreamExtractor {
                 .build()
 
             httpClient.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return null
+                if (!resp.isSuccessful) {
+                    recordDiagnostic(
+                        videoId,
+                        "InnerTube ${profile.clientName}/${profile.clientVersion} returned HTTP ${resp.code}"
+                    )
+                    return null
+                }
                 val root = JSONObject(resp.body?.string().orEmpty())
-                parseInnerTubePlayerResponse(httpClient, root)
+                parseInnerTubePlayerResponse(httpClient, root, videoId, "${profile.clientName}/${profile.clientVersion}")
             }
-        } catch (_: Exception) {
+        } catch (e: Exception) {
+            recordDiagnostic(
+                videoId,
+                "InnerTube ${profile.clientName}/${profile.clientVersion} exception: ${e.javaClass.simpleName}: ${e.message}"
+            )
             null
         }
     }
 
     private fun parseInnerTubePlayerResponse(
         httpClient: OkHttpClient,
-        root: JSONObject
+        root: JSONObject,
+        videoId: String = "",
+        clientTag: String = "InnerTube"
     ): ExtractedSocialStreams? {
-        val playability = root.optJSONObject("playabilityStatus")?.optString("status").orEmpty()
-        if (playability != "OK" && !root.has("streamingData")) return null
+        val playabilityObj = root.optJSONObject("playabilityStatus")
+        val playability = playabilityObj?.optString("status").orEmpty()
+        val playabilityReason = playabilityObj?.optString("reason").orEmpty()
+        if (playability != "OK" && !root.has("streamingData")) {
+            if (videoId.isNotBlank()) {
+                val detail = "$playability: ${playabilityReason.ifBlank { "No streamingData" }}"
+                lastPlayabilityReasons[videoId] = detail
+                recordDiagnostic(videoId, "$clientTag playabilityStatus=$detail")
+            }
+            return null
+        }
 
         val videoDetails = root.optJSONObject("videoDetails")
         val title = videoDetails?.optString("title").orEmpty()
@@ -1385,6 +1474,117 @@ object SocialStreamExtractor {
      * Automatically resolves a fresh, non-403 stream URL when a previously extracted CDN link
      * expires or returns HTTP 401/403/410 during download execution.
      */
+    data class FreshYouTubeTaskStreams(
+        val videoId: String,
+        val primaryUrl: String,
+        val secondaryAudioUrl: String?,
+        val requiresStreamMerge: Boolean,
+        val requiresAudioExtraction: Boolean,
+        val resolutionLabel: String?,
+        val height: Int,
+        val width: Int,
+        val estimatedTotalBytes: Long
+    )
+
+    fun resolveYouTubeVideoIdForTask(
+        sourceUrl: String?,
+        originPageUrl: String?,
+        thumbnailUrl: String?
+    ): String? {
+        val fragment = sourceUrl?.substringAfter('#', "").orEmpty()
+        val fragmentYtId = fragment.substringAfter("ytid=", "").substringBefore('&').trim().takeIf { it.length == 11 }
+        val originYtId = originPageUrl?.let { extractYouTubeVideoId(it) }
+        val sourceYtId = sourceUrl?.let { extractYouTubeVideoId(it) }
+        val thumbYtId = thumbnailUrl?.let {
+            Regex("ytimg\\.com/vi(?:_webp)?/([a-zA-Z0-9_-]{11})").find(it)?.groupValues?.getOrNull(1)
+        }
+        val queryYtId = sourceUrl?.let {
+            Regex("[?&]id=([a-zA-Z0-9_-]{11})(?:&|$)").find(stripUrlFragment(it))?.groupValues?.getOrNull(1)
+        }
+        return fragmentYtId ?: originYtId ?: sourceYtId ?: thumbYtId ?: queryYtId
+    }
+
+    /**
+     * Re-extracts fresh YouTube stream URL(s) from the same InnerTube/Piped session so that both
+     * the primary video stream and any paired audio stream have fresh, un-expired tokens tied to
+     * the active client IP. When `preferProgressiveFallback` is true (e.g. after format/403 retry),
+     * prefers a single-file progressive MP4 stream (`StreamType.PROGRESSIVE`) if available.
+     */
+    fun extractFreshYouTubeTaskStreams(
+        httpClient: OkHttpClient,
+        videoId: String,
+        isAudioMode: Boolean,
+        preferredHeight: Int,
+        preferProgressiveFallback: Boolean = false
+    ): FreshYouTubeTaskStreams? {
+        val extracted = extractYouTubeViaInnerTube(httpClient, videoId)
+            ?: extractYouTubeViaPipedOrInvidious(httpClient, videoId)
+            ?: return null
+
+        if (isAudioMode) {
+            val directAudio = extracted.audioStreams.firstOrNull { !it.isExtractedFromVideo }
+                ?: extracted.audioStreams.firstOrNull()
+            if (directAudio != null) {
+                return FreshYouTubeTaskStreams(
+                    videoId = videoId,
+                    primaryUrl = appendVideoIdFragment(directAudio.downloadUrl, videoId),
+                    secondaryAudioUrl = null,
+                    requiresStreamMerge = false,
+                    requiresAudioExtraction = directAudio.isExtractedFromVideo,
+                    resolutionLabel = null,
+                    height = 0,
+                    width = 0,
+                    estimatedTotalBytes = directAudio.estimatedSizeBytes
+                )
+            }
+            val progVideo = extracted.videoStreams.firstOrNull { it.streamType == StreamType.PROGRESSIVE }
+                ?: extracted.videoStreams.firstOrNull()
+                ?: return null
+            return FreshYouTubeTaskStreams(
+                videoId = videoId,
+                primaryUrl = appendVideoIdFragment(progVideo.downloadUrl, videoId),
+                secondaryAudioUrl = null,
+                requiresStreamMerge = false,
+                requiresAudioExtraction = true,
+                resolutionLabel = null,
+                height = 0,
+                width = 0,
+                estimatedTotalBytes = progVideo.estimatedSizeBytes
+            )
+        }
+
+        val chosenVideo: VideoStreamOption = if (preferProgressiveFallback) {
+            extracted.videoStreams
+                .filter { it.streamType == StreamType.PROGRESSIVE }
+                .minByOrNull { kotlin.math.abs(it.resolutionHeight - preferredHeight) }
+                ?: extracted.videoStreams.minByOrNull { kotlin.math.abs(it.resolutionHeight - preferredHeight) }
+                ?: return null
+        } else {
+            extracted.videoStreams.firstOrNull { it.resolutionHeight == preferredHeight }
+                ?: extracted.videoStreams.minByOrNull { kotlin.math.abs(it.resolutionHeight - preferredHeight) }
+                ?: return null
+        }
+
+        val primaryTagged = appendVideoIdFragment(chosenVideo.downloadUrl, videoId)
+        val pairedTagged = if (chosenVideo.streamType == StreamType.VIDEO_ONLY && !chosenVideo.pairedAudioStreamUrl.isNullOrBlank()) {
+            appendVideoIdFragment(chosenVideo.pairedAudioStreamUrl, videoId)
+        } else {
+            null
+        }
+
+        return FreshYouTubeTaskStreams(
+            videoId = videoId,
+            primaryUrl = primaryTagged,
+            secondaryAudioUrl = pairedTagged,
+            requiresStreamMerge = pairedTagged != null,
+            requiresAudioExtraction = false,
+            resolutionLabel = chosenVideo.resolutionLabel,
+            height = chosenVideo.resolutionHeight,
+            width = chosenVideo.resolutionWidth,
+            estimatedTotalBytes = chosenVideo.totalEstimatedBytes
+        )
+    }
+
     private fun normalizeComparableStreamUrl(rawUrl: String): String {
         val stripped = stripUrlFragment(rawUrl)
         return if (stripped.contains("googlevideo.com/videoplayback")) {

@@ -19,6 +19,7 @@ import com.example.data.preferences.UserSettings
 import com.example.domain.model.AppThemeMode
 import com.example.domain.model.AudioOutputChoice
 import com.example.domain.model.AudioStreamOption
+import com.example.domain.model.DiagnosticsReport
 import com.example.domain.model.DownloadTaskEntity
 import com.example.domain.model.DownloaderMode
 import com.example.domain.model.LibrarySortOption
@@ -112,6 +113,12 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
 
     private val _snackbarMessage = MutableStateFlow<String?>(null)
     val snackbarMessage: StateFlow<String?> = _snackbarMessage.asStateFlow()
+
+    private val _diagnosticsReport = MutableStateFlow<DiagnosticsReport?>(null)
+    val diagnosticsReport: StateFlow<DiagnosticsReport?> = _diagnosticsReport.asStateFlow()
+
+    private val _isRunningDiagnostics = MutableStateFlow(false)
+    val isRunningDiagnostics: StateFlow<Boolean> = _isRunningDiagnostics.asStateFlow()
 
     // Library sort & search
     private val _videoSortOption = MutableStateFlow(LibrarySortOption.DATE_DESC)
@@ -897,6 +904,24 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
         viewModelScope.launch {
             preferencesRepository.setCustomDownloadLocation(treeUri = "", displayLabel = "")
         }
+    }
+
+    fun runDiagnostics() {
+        if (_isRunningDiagnostics.value) return
+        _isRunningDiagnostics.value = true
+        _diagnosticsReport.value = null
+        viewModelScope.launch {
+            try {
+                val report = downloadEngine.runDiagnostics()
+                _diagnosticsReport.value = report
+            } finally {
+                _isRunningDiagnostics.value = false
+            }
+        }
+    }
+
+    fun dismissDiagnosticsReport() {
+        _diagnosticsReport.value = null
     }
 
     override fun onCleared() {

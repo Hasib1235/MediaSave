@@ -57,6 +57,7 @@ import com.example.ui.theme.MidnightBorder
 import com.example.ui.theme.MidnightCard
 import com.example.ui.theme.NeonPurple
 import com.example.ui.theme.TextSecondaryDark
+import androidx.compose.material.icons.outlined.BugReport
 import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.PrivacyTip
@@ -84,6 +85,7 @@ fun SettingsAndBuildScreen(
     onClearCompletedHistory: () -> Unit = {},
     onOpenPrivacyPolicy: () -> Unit = {},
     onOpenAbout: () -> Unit = {},
+    onRunDiagnostics: () -> Unit = {},
     onShowMessage: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
@@ -346,6 +348,15 @@ fun SettingsAndBuildScreen(
                         SettingsDivider()
 
                         SettingsChevronRow(
+                            icon = Icons.Outlined.BugReport,
+                            title = "Run Diagnostics",
+                            subtitle = "Test YouTube extractor, stream download & MediaMuxer health",
+                            onClick = onRunDiagnostics,
+                            testTag = "run_diagnostics_button"
+                        )
+                        SettingsDivider()
+
+                        SettingsChevronRow(
                             icon = Icons.Outlined.Info,
                             title = "About MediaSave",
                             subtitle = "Version 1.0 (Build 1) • Architecture & APK/AAB Build Guide",
@@ -371,11 +382,13 @@ private fun SettingsChevronRow(
     icon: ImageVector,
     title: String,
     subtitle: String,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    testTag: String? = null
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .let { if (testTag != null) it.testTag(testTag) else it }
             .clickable(onClick = onClick)
             .padding(horizontal = 16.dp, vertical = 14.dp),
         verticalAlignment = Alignment.CenterVertically

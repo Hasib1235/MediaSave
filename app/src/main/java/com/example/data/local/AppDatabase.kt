@@ -82,7 +82,7 @@ interface DownloadTaskDao {
     suspend fun getInterruptedTasks(): List<DownloadTaskEntity>
 }
 
-@Database(entities = [DownloadTaskEntity::class], version = 1, exportSchema = false)
+@Database(entities = [DownloadTaskEntity::class], version = 2, exportSchema = false)
 abstract class AppDatabase : RoomDatabase() {
     abstract fun downloadTaskDao(): DownloadTaskDao
 

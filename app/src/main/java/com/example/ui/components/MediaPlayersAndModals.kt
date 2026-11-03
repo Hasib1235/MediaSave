@@ -27,8 +27,15 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.filled.BugReport
+import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.Fullscreen
 import androidx.compose.material.icons.filled.Home
@@ -52,6 +59,8 @@ import androidx.compose.material.icons.filled.VideoLibrary
 import androidx.compose.material.icons.filled.WarningAmber
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -75,18 +84,25 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.viewinterop.AndroidView
+import com.example.data.download.DownloadEngine
+import com.example.domain.model.DiagnosticsReport
 import com.example.domain.model.DownloadTaskEntity
 import com.example.ui.AudioPlayerState
 import com.example.ui.DuplicateDownloadPrompt
 import com.example.ui.theme.AmberWarning
+import com.example.ui.theme.CoralError
 import com.example.ui.theme.ElectricBlue
 import com.example.ui.theme.ElectricCyan
+import com.example.ui.theme.EmeraldSuccess
 import com.example.ui.theme.MidnightBg
 import com.example.ui.theme.MidnightBorder
 import com.example.ui.theme.MidnightCard
@@ -1175,3 +1191,271 @@ fun PrivacyPolicyDialog(
         }
     )
 }
+
+/**
+ * Expandable "Technical details" section with Copy button that displays the last 30 diagnostic lines.
+ */
+@Composable
+fun ExpandableTechnicalDetailsSection(
+    technicalDetails: String,
+    modifier: Modifier = Modifier
+) {
+    if (technicalDetails.isBlank()) return
+    var expanded by remember { mutableStateOf(false) }
+    var copied by remember { mutableStateOf(false) }
+    val clipboardManager = LocalClipboardManager.current
+
+    Column(modifier = modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .clip(RoundedCornerShape(8.dp))
+                .clickable { expanded = !expanded }
+                .padding(vertical = 4.dp)
+                .testTag("toggle_technical_details_button"),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Icon(
+                imageVector = if (expanded) Icons.Default.ExpandLess else Icons.Default.ExpandMore,
+                contentDescription = "Toggle Technical details",
+                tint = NeonPurple,
+                modifier = Modifier.size(18.dp)
+            )
+            Spacer(modifier = Modifier.width(4.dp))
+            Text(
+                text = "Technical details",
+                style = MaterialTheme.typography.labelMedium,
+                color = NeonPurple,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+
+        if (expanded) {
+            Spacer(modifier = Modifier.height(6.dp))
+            Surface(
+                shape = RoundedCornerShape(10.dp),
+                color = MidnightBg.copy(alpha = 0.85f),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .border(1.dp, MidnightBorder, RoundedCornerShape(10.dp))
+                    .testTag("technical_details_box")
+            ) {
+                Column(modifier = Modifier.padding(10.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Diagnostic Log (Last 30 lines)",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = TextSecondaryDark,
+                            fontWeight = FontWeight.Bold
+                        )
+                        TextButton(
+                            onClick = {
+                                runCatching {
+                                    clipboardManager.setText(AnnotatedString(technicalDetails))
+                                    copied = true
+                                }
+                            },
+                            modifier = Modifier.testTag("copy_technical_details_button")
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.ContentCopy,
+                                contentDescription = "Copy Technical Details",
+                                tint = NeonPurple,
+                                modifier = Modifier.size(14.dp)
+                            )
+                            Spacer(modifier = Modifier.width(4.dp))
+                            Text(
+                                text = if (copied) "Copied" else "Copy",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = NeonPurple,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                    }
+                    Text(
+                        text = technicalDetails,
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontFamily = FontFamily.Monospace,
+                            fontSize = 11.sp,
+                            lineHeight = 15.sp
+                        ),
+                        color = Color(0xFFE2E8F0)
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * Self-Test Diagnostics Dialog ("Run diagnostics") that executes a real test extraction + download
+ * of https://www.youtube.com/watch?v=jNQXAC9IVRw and shows extractor version, muxer status, exit code,
+ * and the last 15 log lines with a Copy button.
+ */
+@Composable
+fun DiagnosticsReportDialog(
+    report: DiagnosticsReport?,
+    isRunning: Boolean,
+    onRunAgain: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val clipboardManager = LocalClipboardManager.current
+    var copied by remember(report) { mutableStateOf(false) }
+
+    AlertDialog(
+        onDismissRequest = { if (!isRunning) onDismiss() },
+        icon = {
+            Icon(
+                imageVector = if (report?.isHealthy == true) Icons.Default.CheckCircle else Icons.Default.BugReport,
+                contentDescription = null,
+                tint = when {
+                    isRunning -> NeonPurple
+                    report?.isHealthy == true -> EmeraldSuccess
+                    else -> CoralError
+                }
+            )
+        },
+        title = {
+            Text(
+                text = if (isRunning) "Running Diagnostics..." else "YouTube Downloader Diagnostics",
+                fontWeight = FontWeight.Bold
+            )
+        },
+        text = {
+            if (isRunning || report == null) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 12.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    CircularProgressIndicator(color = NeonPurple)
+                    Text(
+                        text = "Testing real extraction, stream download, and container integrity for:\nhttps://www.youtube.com/watch?v=jNQXAC9IVRw",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+            } else {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState()),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "Status: ${report.statusSummary}",
+                        style = MaterialTheme.typography.titleSmall,
+                        color = if (report.isHealthy) EmeraldSuccess else CoralError,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.testTag("diagnostics_status_summary")
+                    )
+                    Text(
+                        text = "• Extractor: ${report.extractorVersion}",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text(
+                        text = "• MediaMuxer: ${report.muxerStatus}",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text(
+                        text = "• Test Video: ${report.testVideoUrl}",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                    Text(
+                        text = "• Exit Code: ${report.exitCode} • Downloaded: ${DownloadEngine.formatBytesStatic(report.downloadedBytes)} in ${report.durationMs} ms",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+
+                    Spacer(modifier = Modifier.height(4.dp))
+
+                    Surface(
+                        shape = RoundedCornerShape(10.dp),
+                        color = MidnightBg,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .border(1.dp, MidnightBorder, RoundedCornerShape(10.dp))
+                    ) {
+                        Column(modifier = Modifier.padding(10.dp)) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceBetween,
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Text(
+                                    text = "Last 15 Diagnostic Lines",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = TextSecondaryDark,
+                                    fontWeight = FontWeight.Bold
+                                )
+                                TextButton(
+                                    onClick = {
+                                        runCatching {
+                                            val fullCopy = buildString {
+                                                appendLine("Extractor: ${report.extractorVersion}")
+                                                appendLine("MediaMuxer: ${report.muxerStatus}")
+                                                appendLine("Test URL: ${report.testVideoUrl}")
+                                                appendLine("Exit Code: ${report.exitCode} (${report.statusSummary})")
+                                                appendLine(report.formattedLog)
+                                            }
+                                            clipboardManager.setText(AnnotatedString(fullCopy))
+                                            copied = true
+                                        }
+                                    },
+                                    modifier = Modifier.testTag("copy_diagnostics_report_button")
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Default.ContentCopy,
+                                        contentDescription = "Copy Diagnostics",
+                                        tint = NeonPurple,
+                                        modifier = Modifier.size(14.dp)
+                                    )
+                                    Spacer(modifier = Modifier.width(4.dp))
+                                    Text(
+                                        text = if (copied) "Copied" else "Copy",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = NeonPurple
+                                    )
+                                }
+                            }
+                            Text(
+                                text = report.formattedLog,
+                                style = MaterialTheme.typography.labelSmall.copy(
+                                    fontFamily = FontFamily.Monospace,
+                                    fontSize = 11.sp,
+                                    lineHeight = 15.sp
+                                ),
+                                color = Color(0xFFE2E8F0),
+                                modifier = Modifier.testTag("diagnostics_log_output")
+                            )
+                        }
+                    }
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = onDismiss,
+                enabled = !isRunning,
+                modifier = Modifier.testTag("close_diagnostics_dialog_button")
+            ) {
+                Text("Close")
+            }
+        },
+        dismissButton = {
+            if (!isRunning) {
+                OutlinedButton(
+                    onClick = onRunAgain,
+                    modifier = Modifier.testTag("re_run_diagnostics_button")
+                ) {
+                    Text("Run Again")
+                }
+            }
+        }
+    )
+}
+

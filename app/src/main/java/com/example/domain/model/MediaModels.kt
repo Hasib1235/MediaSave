@@ -331,6 +331,7 @@ data class DownloadTaskEntity(
     val isConverted: Boolean = false,
     val conversionNote: String? = null,
     val errorMessage: String? = null,
+    val technicalDetails: String? = null,
     val checksumSha256: String? = null,
     val createdAt: Long = System.currentTimeMillis(),
     val completedAt: Long? = null
@@ -349,6 +350,22 @@ data class DownloadTaskEntity(
 
     val progressPercent: Int
         get() = (progressFraction * 100f).toInt().coerceIn(0, 100)
+}
+
+data class DiagnosticsReport(
+    val isHealthy: Boolean,
+    val extractorVersion: String,
+    val muxerStatus: String,
+    val testVideoUrl: String,
+    val exitCode: Int,
+    val statusSummary: String,
+    val downloadedBytes: Long,
+    val durationMs: Long,
+    val logLines: List<String>,
+    val timestampMs: Long = System.currentTimeMillis()
+) {
+    val formattedLog: String
+        get() = logLines.takeLast(15).joinToString("\n")
 }
 
 enum class LibrarySortOption(val label: String) {

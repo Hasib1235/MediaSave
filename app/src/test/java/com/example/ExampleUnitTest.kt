@@ -231,4 +231,78 @@ class ExampleUnitTest {
         assertFalse(sanitized.contains("private/folder"))
         assertEquals("https://cdn.example.org/.../*.mp4", sanitized)
     }
+
+    @Test
+    fun `youtube error mapping translates bot check 403 and private video reasons into exact messages`() {
+        val (_, botMsg) = com.example.data.platform.SocialStreamExtractor.mapYouTubeFailureMessage(
+            rawReasonOrError = "Sign in to confirm you're not a bot (HTTP 403)"
+        )
+        assertEquals(
+            "YouTube is blocking this server's IP address or rejected the session token (HTTP 403).",
+            botMsg
+        )
+
+        val (_, privateMsg) = com.example.data.platform.SocialStreamExtractor.mapYouTubeFailureMessage(
+            rawReasonOrError = "This is a private video. Please sign in to verify that you may see it."
+        )
+        assertEquals(
+            "This YouTube video is private, members-only, or unavailable.",
+            privateMsg
+        )
+
+        val report = com.example.domain.model.DiagnosticsReport(
+            isHealthy = true,
+            extractorVersion = com.example.data.platform.SocialStreamExtractor.EXTRACTOR_ENGINE_VERSION,
+            muxerStatus = "Available (Android MediaExtractor + MediaMuxer MP4/M4A)",
+            testVideoUrl = "https://www.youtube.com/watch?v=jNQXAC9IVRw",
+            exitCode = 0,
+            statusSummary = "Healthy — Real extraction & download succeeded",
+            downloadedBytes = 128_000L,
+            durationMs = 950L,
+            logLines = (1..20).map { "Line $it" }
+        )
+        // formattedLog must contain the last 15 lines
+        assertEquals(15, report.formattedLog.lines().size)
+        assertTrue(report.formattedLog.contains("Line 20"))
+        assertFalse(report.formattedLog.contains("Line 5\n"))
+    }
+
+    @Test
+    fun `isStreamUrlDownloadable probes stream with Range header only and never sends duplicate range query param`() {
+        var sawDuplicateRangeQuery = false
+        var sawRangeHeader = false
+        val mockClient = okhttp3.OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                val reqUrl = req.url.toString()
+                if (req.header("Range") == "bytes=0-1023") {
+                    sawRangeHeader = true
+                }
+                if (reqUrl.contains("range=0-1023") && req.header("Range") != null) {
+                    sawDuplicateRangeQuery = true
+                }
+                val dummyBytes = ByteArray(1024) { 0x11 }
+                okhttp3.Response.Builder()
+                    .request(req)
+                    .protocol(okhttp3.Protocol.HTTP_1_1)
+                    .code(206)
+                    .message("Partial Content")
+                    .header("Content-Type", "video/mp4")
+                    .header("Content-Range", "bytes 0-1023/480000")
+                    .header("Content-Length", "1024")
+                    .body(okhttp3.ResponseBody.Companion.run { dummyBytes.toResponseBody(okhttp3.MediaType.Companion.run { "video/mp4".toMediaType() }) })
+                    .build()
+            }
+            .build()
+
+        val downloadable = com.example.data.platform.SocialStreamExtractor.isStreamUrlDownloadable(
+            httpClient = mockClient,
+            streamUrl = "https://rr1---sn-test.googlevideo.com/videoplayback?itag=18&clen=480000&expire=1999999999"
+        )
+        assertTrue(downloadable)
+        assertTrue("Probe must send Range: bytes=0-1023 header", sawRangeHeader)
+        assertFalse("Must never send duplicate ?range=0-1023 query with Range header", sawDuplicateRangeQuery)
+    }
 }
+
+

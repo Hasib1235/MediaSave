@@ -863,6 +863,7 @@ fun ShareIntentErrorOverlay(
     sharedUrl: String,
     errorTitle: String,
     errorMessage: String,
+    technicalDetail: String? = null,
     onRetry: () -> Unit,
     onDismissToHome: () -> Unit
 ) {
@@ -914,6 +915,11 @@ fun ShareIntentErrorOverlay(
                 color = TextSecondaryDark,
                 textAlign = TextAlign.Center
             )
+
+            if (!technicalDetail.isNullOrBlank()) {
+                Spacer(modifier = Modifier.height(10.dp))
+                ExpandableTechnicalDetailsSection(technicalDetails = technicalDetail)
+            }
 
             if (sharedUrl.isNotBlank()) {
                 Spacer(modifier = Modifier.height(12.dp))

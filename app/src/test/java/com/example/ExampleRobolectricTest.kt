@@ -1443,5 +1443,118 @@ class ExampleRobolectricTest {
 
         db.close()
     }
+
+    @Test
+    fun `runDiagnostics executes end to end test extraction and download of jNQXAC9IVRw and cleans up temp file`() = runBlocking {
+        val context = ApplicationProvider.getApplicationContext<Application>()
+        val db = Room.inMemoryDatabaseBuilder(context, AppDatabase::class.java)
+            .allowMainThreadQueries()
+            .build()
+        val dao = db.downloadTaskDao()
+
+        val samples = LocalSampleMediaGenerator.ensureAuthorizedSamplesReady(context)
+        val validMp4Bytes = File(android.net.Uri.parse(samples.first { it.id == "sample_direct_720p" }.uri).path!!).readBytes()
+
+        val diagClient = OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val req = chain.request()
+                val reqUrl = req.url.toString()
+                when {
+                    reqUrl.contains("youtubei/v1/player") -> {
+                        val json = """
+                            {
+                              "playabilityStatus": {"status": "OK"},
+                              "videoDetails": {"title": "Me at the zoo", "author": "jawed", "lengthSeconds": "19"},
+                              "streamingData": {
+                                "formats": [
+                                  {
+                                    "itag": 18,
+                                    "url": "https://rr1---sn-test.googlevideo.com/videoplayback?itag=18&clen=${validMp4Bytes.size}",
+                                    "mimeType": "video/mp4; codecs=\"avc1.42001E, mp4a.40.2\"",
+                                    "width": 640,
+                                    "height": 360,
+                                    "bitrate": 500000,
+                                    "contentLength": "${validMp4Bytes.size}",
+                                    "fps": 30
+                                  }
+                                ]
+                              }
+                            }
+                        """.trimIndent()
+                        Response.Builder()
+                            .request(req)
+                            .protocol(Protocol.HTTP_1_1)
+                            .code(200)
+                            .message("OK")
+                            .header("Content-Type", "application/json")
+                            .body(json.toResponseBody("application/json".toMediaType()))
+                            .build()
+                    }
+                    reqUrl.contains("googlevideo.com/videoplayback") -> {
+                        val rangeHeader = req.header("Range")
+                        if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
+                            val parts = rangeHeader.removePrefix("bytes=").split("-")
+                            val start = parts[0].toIntOrNull() ?: 0
+                            val end = parts.getOrNull(1)?.takeIf { it.isNotBlank() }?.toIntOrNull()
+                                ?.coerceAtMost(validMp4Bytes.size - 1)
+                                ?: (validMp4Bytes.size - 1)
+                            val slice = validMp4Bytes.copyOfRange(start, (end + 1).coerceAtMost(validMp4Bytes.size))
+                            Response.Builder()
+                                .request(req)
+                                .protocol(Protocol.HTTP_1_1)
+                                .code(206)
+                                .message("Partial Content")
+                                .header("Content-Type", "video/mp4")
+                                .header("Accept-Ranges", "bytes")
+                                .header("Content-Range", "bytes $start-${start + slice.size - 1}/${validMp4Bytes.size}")
+                                .header("Content-Length", slice.size.toString())
+                                .body(slice.toResponseBody("video/mp4".toMediaType()))
+                                .build()
+                        } else {
+                            Response.Builder()
+                                .request(req)
+                                .protocol(Protocol.HTTP_1_1)
+                                .code(200)
+                                .message("OK")
+                                .header("Content-Type", "video/mp4")
+                                .header("Content-Length", validMp4Bytes.size.toString())
+                                .body(validMp4Bytes.toResponseBody("video/mp4".toMediaType()))
+                                .build()
+                        }
+                    }
+                    else -> {
+                        Response.Builder()
+                            .request(req)
+                            .protocol(Protocol.HTTP_1_1)
+                            .code(404)
+                            .message("Not Found")
+                            .body("".toResponseBody("text/plain".toMediaType()))
+                            .build()
+                    }
+                }
+            }
+            .build()
+
+        val engine = DownloadEngine(
+            context = context,
+            dao = dao,
+            externalScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
+            httpClient = diagClient
+        )
+
+        val report = engine.runDiagnostics()
+        assertTrue("Diagnostics should succeed: ${report.statusSummary}\n${report.formattedLog}", report.isHealthy)
+        assertEquals(0, report.exitCode)
+        assertEquals("https://www.youtube.com/watch?v=jNQXAC9IVRw", report.testVideoUrl)
+        assertEquals(validMp4Bytes.size.toLong(), report.downloadedBytes)
+        assertTrue(report.formattedLog.contains("Container integrity verified"))
+
+        // Verify temporary diagnostic files were deleted from cacheDir
+        val leftoverDiagFiles = context.cacheDir.listFiles()?.filter { it.name.startsWith("diag_test_") }.orEmpty()
+        assertTrue("All temporary diagnostic files must be deleted after test", leftoverDiagFiles.isEmpty())
+
+        db.close()
+    }
 }
+
 

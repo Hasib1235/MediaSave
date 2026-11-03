@@ -77,6 +77,7 @@ import com.example.data.media.AuthorizedSampleItem
 import com.example.domain.model.DownloadTaskEntity
 import com.example.domain.model.DownloaderMode
 import com.example.domain.model.MediaAnalysisState
+import com.example.ui.components.ExpandableTechnicalDetailsSection
 import com.example.ui.components.MediaSaveGradientTitle
 import com.example.ui.components.MediaThumbnailArtwork
 import com.example.ui.components.PlatformBrandIconItem
@@ -112,6 +113,7 @@ fun HomeScreen(
     onOpenDrawer: () -> Unit = {},
     onDeleteTask: (String) -> Unit = {},
     onShareTask: (DownloadTaskEntity) -> Unit = {},
+    onRunDiagnostics: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val clipboardManager = LocalClipboardManager.current
@@ -356,6 +358,19 @@ fun HomeScreen(
                                         style = MaterialTheme.typography.bodySmall,
                                         color = MaterialTheme.colorScheme.onSurface
                                     )
+                                    if (!analysisState.technicalDetail.isNullOrBlank()) {
+                                        Spacer(modifier = Modifier.height(6.dp))
+                                        ExpandableTechnicalDetailsSection(
+                                            technicalDetails = analysisState.technicalDetail
+                                        )
+                                    }
+                                    Spacer(modifier = Modifier.height(8.dp))
+                                    OutlinedButton(
+                                        onClick = onRunDiagnostics,
+                                        modifier = Modifier.testTag("home_error_run_diagnostics_button")
+                                    ) {
+                                        Text("Run diagnostics")
+                                    }
                                 }
                             }
                         }

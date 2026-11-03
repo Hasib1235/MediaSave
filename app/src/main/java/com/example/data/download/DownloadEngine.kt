@@ -27,6 +27,7 @@ import com.example.domain.model.AnalyzedMediaMetadata
 import com.example.domain.model.AudioFormat
 import com.example.domain.model.AudioOutputChoice
 import com.example.domain.model.AudioStreamOption
+import com.example.domain.model.DiagnosticsReport
 import com.example.domain.model.DownloadStatus
 import com.example.domain.model.DownloadTaskEntity
 import com.example.domain.model.DownloaderMode
@@ -61,8 +62,12 @@ import java.net.SocketTimeoutException
 import java.net.URI
 import java.net.UnknownHostException
 import java.security.MessageDigest
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.TimeUnit
 import javax.net.ssl.SSLException
 
@@ -85,7 +90,7 @@ class DownloadEngine(
     private val httpClient: OkHttpClient = OkHttpClient.Builder()
         .dns(SocialStreamExtractor.IPV4_FIRST_DNS)
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
         .build()
@@ -94,6 +99,7 @@ class DownloadEngine(
     private val pausedOrCancelledTasks = ConcurrentHashMap<String, DownloadStatus>()
     private val taskOriginUrls = ConcurrentHashMap<String, String>()
     private val taskFallbackUrls = ConcurrentHashMap<String, List<String>>()
+    private val taskDiagnosticLogs = ConcurrentHashMap<String, ConcurrentLinkedDeque<String>>()
     private val startupRecoveryDeferred = CompletableDeferred<Unit>()
     @Volatile
     private var concurrencySemaphore = Semaphore(3)
@@ -111,6 +117,49 @@ class DownloadEngine(
     private val downloadsDir: File
         get() = File(context.filesDir, "downloads").apply { mkdirs() }
 
+    private fun appendTaskLog(taskId: String, message: String) {
+        val deque = taskDiagnosticLogs.getOrPut(taskId) { ConcurrentLinkedDeque() }
+        val ts = SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())
+        deque.addLast("[$ts] $message")
+        while (deque.size > 30) {
+            deque.pollFirst()
+        }
+    }
+
+    private fun buildTechnicalDetailsForTask(
+        taskId: String,
+        task: DownloadTaskEntity,
+        finalError: String? = null
+    ): String {
+        val ytId = SocialStreamExtractor.resolveYouTubeVideoIdForTask(
+            sourceUrl = task.sourceUrl,
+            originPageUrl = taskOriginUrls[taskId],
+            thumbnailUrl = task.thumbnailUrl
+        )
+        val extractorLines = if (!ytId.isNullOrBlank()) {
+            SocialStreamExtractor.getDiagnosticLog(ytId)
+        } else {
+            SocialStreamExtractor.getDiagnosticLog(task.sourceUrl)
+        }
+        val taskLines = taskDiagnosticLogs[taskId]?.toList().orEmpty()
+        val combined = buildList {
+            add("Engine: ${SocialStreamExtractor.EXTRACTOR_ENGINE_VERSION}")
+            add("Platform: ${task.platformName} • Mode: ${task.mode} • Res: ${task.resolutionLabel ?: "Audio"}")
+            if (!ytId.isNullOrBlank()) {
+                add("YouTube Video ID: $ytId")
+                SocialStreamExtractor.getLastPlayabilityReason(ytId)?.let {
+                    add("Last Playability Status: $it")
+                }
+            }
+            addAll(extractorLines.takeLast(12))
+            addAll(taskLines.takeLast(18))
+            if (!finalError.isNullOrBlank()) {
+                add("Final Status: $finalError")
+            }
+        }
+        return combined.takeLast(30).joinToString("\n")
+    }
+
     init {
         createNotificationChannel()
         externalScope.launch(Dispatchers.IO) {
@@ -118,7 +167,7 @@ class DownloadEngine(
                 runCatching {
                     val recovered = dao.recoverInterruptedTasksOnStartup()
                     if (recovered > 0) {
-                        Log.i(TAG, "Recovered $recovered interrupted download task(s) to PAUSED state.")
+                        Log.i(TAG, "Recovered $recovered interrupted download task(s) on startup.")
                     }
                 }
             } finally {
@@ -478,238 +527,391 @@ class DownloadEngine(
         startupRecoveryDeferred.await()
         if (pausedOrCancelledTasks.containsKey(taskId)) return@withContext
 
-        val initialTask = dao.getTaskById(taskId) ?: return@withContext
-        if (initialTask.statusEnum == DownloadStatus.PAUSED || initialTask.statusEnum == DownloadStatus.CANCELLED) {
+        var activeTask = dao.getTaskById(taskId) ?: return@withContext
+        if (activeTask.statusEnum == DownloadStatus.PAUSED || activeTask.statusEnum == DownloadStatus.CANCELLED) {
             return@withContext
         }
 
-        val finalFile = File(initialTask.outputFilePath)
-        val primaryPartFile = File("${initialTask.outputFilePath}.part")
-        val secondaryAudioPartFile = File("${initialTask.outputFilePath}.audio.part")
-        val sanitizedUrl = UrlValidator.sanitizeUrlForDiagnosticLog(initialTask.sourceUrl)
+        val finalFile = File(activeTask.outputFilePath)
+        val primaryPartFile = File("${activeTask.outputFilePath}.part")
+        val secondaryAudioPartFile = File("${activeTask.outputFilePath}.audio.part")
+        val sanitizedUrl = UrlValidator.sanitizeUrlForDiagnosticLog(activeTask.sourceUrl)
+        val ytVideoId = SocialStreamExtractor.resolveYouTubeVideoIdForTask(
+            sourceUrl = activeTask.sourceUrl,
+            originPageUrl = taskOriginUrls[taskId],
+            thumbnailUrl = activeTask.thumbnailUrl
+        )
 
-        try {
-            // Pre-flight check 1: Validate URL is not mock or invalid
-            when (val validation = UrlValidator.validateAndClassify(initialTask.sourceUrl)) {
-                is UrlValidationResult.Invalid -> {
-                    throw IllegalArgumentException("${validation.errorTitle}: ${validation.errorMessage}")
+        appendTaskLog(
+            taskId,
+            "Starting download pipeline for '${activeTask.title}' (${activeTask.platformName}, mode=${activeTask.mode})"
+        )
+
+        val maxJobAttempts = 3 // Initial attempt + up to 2 automatic retries (waiting 3s between tries)
+        var lastException: Exception? = null
+
+        for (jobAttempt in 1..maxJobAttempts) {
+            try {
+                currentCoroutineContext().ensureActive()
+                if (pausedOrCancelledTasks.containsKey(taskId)) {
+                    throw CancellationException("Task paused or cancelled")
                 }
-                is UrlValidationResult.Valid -> {
-                    if (!validation.platform.supportsDirectDownload) {
-                        throw IllegalArgumentException("${validation.platform.displayName} does not permit direct stream downloading.")
+
+                // Pre-flight check 1: Validate URL is not mock or invalid
+                when (val validation = UrlValidator.validateAndClassify(activeTask.sourceUrl)) {
+                    is UrlValidationResult.Invalid -> {
+                        throw IllegalArgumentException("${validation.errorTitle}: ${validation.errorMessage}")
+                    }
+                    is UrlValidationResult.Valid -> {
+                        if (!validation.platform.supportsDirectDownload) {
+                            throw IllegalArgumentException("${validation.platform.displayName} does not permit direct stream downloading.")
+                        }
                     }
                 }
-            }
 
-            // Pre-flight check 2: Verify network state for remote URLs & sufficient device storage
-            checkNetworkConnectivity(initialTask.sourceUrl)
-            checkAvailableStorageSpace(initialTask.totalBytes)
+                // Pre-flight check 2: Verify network state for remote URLs & sufficient device storage
+                checkNetworkConnectivity(activeTask.sourceUrl)
+                checkAvailableStorageSpace(activeTask.totalBytes)
 
-            val hasDualStreams = initialTask.requiresStreamMerge && !initialTask.secondaryAudioUrl.isNullOrBlank()
-            val primaryExpectedTrackBytes = if (hasDualStreams) 0L else initialTask.totalBytes
+                // If retrying (jobAttempt > 1) or if a YouTube URL is already expired before starting, refresh streams
+                val primaryExpired = SocialStreamExtractor.isStreamUrlExpired(activeTask.sourceUrl)
+                val secondaryExpired = !activeTask.secondaryAudioUrl.isNullOrBlank() &&
+                    SocialStreamExtractor.isStreamUrlExpired(activeTask.secondaryAudioUrl!!)
+                if ((jobAttempt > 1 || primaryExpired || secondaryExpired) && !ytVideoId.isNullOrBlank()) {
+                    val useProgressiveFallback = jobAttempt >= 2
+                    appendTaskLog(
+                        taskId,
+                        "Attempt $jobAttempt/$maxJobAttempts: Re-extracting fresh YouTube streams for videoId=$ytVideoId (progressiveFallback=$useProgressiveFallback)"
+                    )
+                    dao.updateProgress(
+                        id = taskId,
+                        downloadedBytes = activeTask.downloadedBytes,
+                        totalBytes = activeTask.totalBytes,
+                        speedBytesPerSec = 0L,
+                        etaSeconds = -1L,
+                        status = DownloadStatus.DOWNLOADING.name,
+                        statusDetail = if (jobAttempt > 1) {
+                            "Refreshing stream & retrying (attempt $jobAttempt of $maxJobAttempts)..."
+                        } else {
+                            "Refreshing expired YouTube stream..."
+                        }
+                    )
+                    val freshStreams = SocialStreamExtractor.extractFreshYouTubeTaskStreams(
+                        httpClient = httpClient,
+                        videoId = ytVideoId,
+                        isAudioMode = activeTask.mode == DownloaderMode.MUSIC.name,
+                        preferredHeight = activeTask.height.takeIf { it > 0 } ?: 720,
+                        preferProgressiveFallback = useProgressiveFallback
+                    )
+                    if (freshStreams != null) {
+                        val oldItag = Regex("[?&]itag=(\\d+)(?:&|$)").find(activeTask.sourceUrl)?.groupValues?.getOrNull(1)
+                        val newItag = Regex("[?&]itag=(\\d+)(?:&|$)").find(freshStreams.primaryUrl)?.groupValues?.getOrNull(1)
+                        if (oldItag != newItag || freshStreams.requiresStreamMerge != activeTask.requiresStreamMerge) {
+                            appendTaskLog(
+                                taskId,
+                                "Switched YouTube stream itag ($oldItag -> $newItag, merge=${freshStreams.requiresStreamMerge}); resetting .part files"
+                            )
+                            runCatching {
+                                if (primaryPartFile.exists()) primaryPartFile.delete()
+                                if (secondaryAudioPartFile.exists()) secondaryAudioPartFile.delete()
+                            }
+                        }
+                        activeTask = activeTask.copy(
+                            sourceUrl = freshStreams.primaryUrl,
+                            secondaryAudioUrl = freshStreams.secondaryAudioUrl,
+                            requiresStreamMerge = freshStreams.requiresStreamMerge,
+                            requiresAudioExtraction = freshStreams.requiresAudioExtraction || activeTask.requiresAudioExtraction,
+                            resolutionLabel = freshStreams.resolutionLabel ?: activeTask.resolutionLabel,
+                            height = if (freshStreams.height > 0) freshStreams.height else activeTask.height,
+                            width = if (freshStreams.width > 0) freshStreams.width else activeTask.width,
+                            totalBytes = if (freshStreams.estimatedTotalBytes > 0L) freshStreams.estimatedTotalBytes else activeTask.totalBytes,
+                            downloadedBytes = if (primaryPartFile.exists()) primaryPartFile.length() else 0L
+                        )
+                        dao.upsertTask(activeTask)
+                    } else {
+                        appendTaskLog(taskId, "Attempt $jobAttempt/$maxJobAttempts: Fresh YouTube stream extraction returned null")
+                    }
+                }
 
-            // Stage 1: Transfer primary stream to temporary .part file (with Range resume support)
-            dao.updateProgress(
-                id = taskId,
-                downloadedBytes = initialTask.downloadedBytes,
-                totalBytes = initialTask.totalBytes,
-                speedBytesPerSec = 0L,
-                etaSeconds = -1L,
-                status = DownloadStatus.DOWNLOADING.name,
-                statusDetail = "Connecting to media stream..."
-            )
+                val hasDualStreams = activeTask.requiresStreamMerge && !activeTask.secondaryAudioUrl.isNullOrBlank()
+                val primaryExpectedTrackBytes = if (hasDualStreams) 0L else activeTask.totalBytes
 
-            transferStreamToFile(
-                taskId = taskId,
-                sourceUrl = initialTask.sourceUrl,
-                targetPartFile = primaryPartFile,
-                supportsResume = initialTask.supportsRangeResume,
-                expectedTrackBytes = primaryExpectedTrackBytes,
-                overallTotalBytes = initialTask.totalBytes,
-                baseByteOffset = 0L
-            )
-
-            if (!primaryPartFile.exists() || primaryPartFile.length() == 0L) {
-                throw IOException("Empty response: Downloaded stream wrote 0 bytes to temporary file.")
-            }
-
-            // Stage 2: If video-only adaptive stream requires merging with paired audio stream
-            if (hasDualStreams && !initialTask.secondaryAudioUrl.isNullOrBlank()) {
-                val primaryBytes = primaryPartFile.length()
-                val overallExpected = initialTask.totalBytes.coerceAtLeast(primaryBytes)
+                // Stage 1: Transfer primary stream to temporary .part file (with Range resume support)
                 dao.updateProgress(
                     id = taskId,
-                    downloadedBytes = primaryBytes,
-                    totalBytes = overallExpected,
+                    downloadedBytes = activeTask.downloadedBytes,
+                    totalBytes = activeTask.totalBytes,
                     speedBytesPerSec = 0L,
-                    etaSeconds = 1L,
+                    etaSeconds = -1L,
                     status = DownloadStatus.DOWNLOADING.name,
-                    statusDetail = "Downloading paired audio stream..."
+                    statusDetail = if (jobAttempt > 1) {
+                        "Downloading stream (retry ${jobAttempt - 1}/2)..."
+                    } else {
+                        "Connecting to media stream..."
+                    }
                 )
 
                 transferStreamToFile(
                     taskId = taskId,
-                    sourceUrl = initialTask.secondaryAudioUrl,
-                    targetPartFile = secondaryAudioPartFile,
-                    supportsResume = true,
-                    expectedTrackBytes = 0L,
-                    overallTotalBytes = overallExpected,
-                    baseByteOffset = primaryBytes
+                    sourceUrl = activeTask.sourceUrl,
+                    targetPartFile = primaryPartFile,
+                    supportsResume = activeTask.supportsRangeResume,
+                    expectedTrackBytes = primaryExpectedTrackBytes,
+                    overallTotalBytes = activeTask.totalBytes,
+                    baseByteOffset = 0L
                 )
 
-                val combinedRawBytes = primaryPartFile.length() + secondaryAudioPartFile.length()
-                dao.updateProgress(
-                    id = taskId,
-                    downloadedBytes = combinedRawBytes,
-                    totalBytes = combinedRawBytes,
-                    speedBytesPerSec = 0L,
-                    etaSeconds = 1L,
-                    status = DownloadStatus.MERGING_STREAMS.name,
-                    statusDetail = "Muxing video + audio via Android MediaMuxer..."
-                )
-
-                val mergedOk = MediaProcessorEngine.mergeVideoAndAudioStreams(
-                    videoFile = primaryPartFile,
-                    audioFile = secondaryAudioPartFile,
-                    outputFile = finalFile
-                )
-                primaryPartFile.delete()
-                secondaryAudioPartFile.delete()
-                if (!mergedOk) {
-                    if (finalFile.exists()) finalFile.delete()
-                    throw IllegalStateException("Stream muxing failed: MediaMuxer could not combine video and audio tracks.")
+                if (!primaryPartFile.exists() || primaryPartFile.length() == 0L) {
+                    throw IOException("Empty response: Downloaded stream wrote 0 bytes to temporary file.")
                 }
-            } else if (initialTask.mode == DownloaderMode.MUSIC.name &&
-                (initialTask.requiresAudioExtraction || initialTask.isConverted)
-            ) {
-                // Stage 3: Lawful Audio Extraction or Format Conversion
-                val statusStage = if (initialTask.requiresAudioExtraction && !initialTask.isConverted) {
-                    DownloadStatus.EXTRACTING_AUDIO
-                } else {
-                    DownloadStatus.CONVERTING_AUDIO
-                }
-                val targetFormat = runCatching {
-                    AudioFormat.valueOf(initialTask.targetAudioFormat ?: "M4A")
-                }.getOrDefault(AudioFormat.M4A)
 
-                dao.updateProgress(
-                    id = taskId,
-                    downloadedBytes = primaryPartFile.length(),
-                    totalBytes = initialTask.totalBytes.coerceAtLeast(primaryPartFile.length()),
-                    speedBytesPerSec = 0L,
-                    etaSeconds = 1L,
-                    status = statusStage.name,
-                    statusDetail = "${statusStage.label} -> ${targetFormat.label}..."
-                )
+                // Refresh activeTask in case resolveFreshUrlForTask updated URLs during Stage 1
+                activeTask = dao.getTaskById(taskId) ?: activeTask
 
-                val convertedOk = MediaProcessorEngine.extractOrConvertAudio(
-                    sourceFile = primaryPartFile,
-                    outputFile = finalFile,
-                    targetFormat = targetFormat,
-                    sampleRateHz = initialTask.sampleRateHz.takeIf { it > 0 } ?: 44100,
-                    channelCount = if (initialTask.channelConfig.contains("Mono")) 1 else 2
-                )
-                primaryPartFile.delete()
-                if (!convertedOk) {
-                    if (finalFile.exists()) finalFile.delete()
-                    throw IllegalStateException(
-                        "Conversion failure: Could not convert or extract audio to ${targetFormat.label} (${targetFormat.codecDescription})."
+                // Stage 2: If video-only adaptive stream requires merging with paired audio stream
+                if (hasDualStreams && !activeTask.secondaryAudioUrl.isNullOrBlank()) {
+                    val primaryBytes = primaryPartFile.length()
+                    val overallExpected = activeTask.totalBytes.coerceAtLeast(primaryBytes)
+                    appendTaskLog(
+                        taskId,
+                        "Stage 1 video complete (${formatBytesStatic(primaryBytes)}). Starting Stage 2 paired audio stream..."
                     )
-                }
-            } else {
-                // Direct progressive stream move from temporary .part file to final target file
-                finalFile.parentFile?.mkdirs()
-                if (finalFile.exists()) finalFile.delete()
-                if (!primaryPartFile.renameTo(finalFile)) {
-                    primaryPartFile.copyTo(finalFile, overwrite = true)
+                    dao.updateProgress(
+                        id = taskId,
+                        downloadedBytes = primaryBytes,
+                        totalBytes = overallExpected,
+                        speedBytesPerSec = 0L,
+                        etaSeconds = 1L,
+                        status = DownloadStatus.DOWNLOADING.name,
+                        statusDetail = "Downloading paired audio stream..."
+                    )
+
+                    transferStreamToFile(
+                        taskId = taskId,
+                        sourceUrl = activeTask.secondaryAudioUrl!!,
+                        targetPartFile = secondaryAudioPartFile,
+                        supportsResume = true,
+                        expectedTrackBytes = 0L,
+                        overallTotalBytes = overallExpected,
+                        baseByteOffset = primaryBytes
+                    )
+
+                    val combinedRawBytes = primaryPartFile.length() + secondaryAudioPartFile.length()
+                    appendTaskLog(
+                        taskId,
+                        "Stage 2 audio complete (${formatBytesStatic(secondaryAudioPartFile.length())}). Merging via MediaMuxer..."
+                    )
+                    dao.updateProgress(
+                        id = taskId,
+                        downloadedBytes = combinedRawBytes,
+                        totalBytes = combinedRawBytes,
+                        speedBytesPerSec = 0L,
+                        etaSeconds = 1L,
+                        status = DownloadStatus.MERGING_STREAMS.name,
+                        statusDetail = "Merging video + audio via Android MediaMuxer..."
+                    )
+
+                    val mergedOk = MediaProcessorEngine.mergeVideoAndAudioStreams(
+                        videoFile = primaryPartFile,
+                        audioFile = secondaryAudioPartFile,
+                        outputFile = finalFile
+                    )
                     primaryPartFile.delete()
-                }
-            }
+                    secondaryAudioPartFile.delete()
+                    if (!mergedOk) {
+                        if (finalFile.exists()) finalFile.delete()
+                        throw IllegalStateException("Stream muxing failed: MediaMuxer could not combine video and audio tracks.")
+                    }
+                } else if (activeTask.mode == DownloaderMode.MUSIC.name &&
+                    (activeTask.requiresAudioExtraction || activeTask.isConverted)
+                ) {
+                    // Stage 3: Lawful Audio Extraction or Format Conversion
+                    val statusStage = if (activeTask.requiresAudioExtraction && !activeTask.isConverted) {
+                        DownloadStatus.EXTRACTING_AUDIO
+                    } else {
+                        DownloadStatus.CONVERTING_AUDIO
+                    }
+                    val targetFormat = runCatching {
+                        AudioFormat.valueOf(activeTask.targetAudioFormat ?: "M4A")
+                    }.getOrDefault(AudioFormat.M4A)
 
-            // Stage 4: File-size & integrity validation + MediaExtractor post-inspection + MediaStore / SAF Save
-            dao.updateProgress(
-                id = taskId,
-                downloadedBytes = finalFile.length(),
-                totalBytes = finalFile.length(),
-                speedBytesPerSec = 0L,
-                etaSeconds = 0L,
-                status = DownloadStatus.VALIDATING.name,
-                statusDetail = "Verifying file integrity and saving to MediaStore..."
-            )
+                    appendTaskLog(taskId, "Stage 3: ${statusStage.label} -> ${targetFormat.label}")
+                    dao.updateProgress(
+                        id = taskId,
+                        downloadedBytes = primaryPartFile.length(),
+                        totalBytes = activeTask.totalBytes.coerceAtLeast(primaryPartFile.length()),
+                        speedBytesPerSec = 0L,
+                        etaSeconds = 1L,
+                        status = statusStage.name,
+                        statusDetail = "${statusStage.label} -> ${targetFormat.label}..."
+                    )
 
-            val integrityResult = MediaProcessorEngine.validateMediaFileIntegrity(finalFile)
-            if (integrityResult.isFailure) {
-                val err = integrityResult.exceptionOrNull()
-                if (finalFile.exists()) finalFile.delete()
-                throw IllegalStateException(err?.message ?: "Downloaded file failed container integrity verification.")
-            }
-
-            val inspected = integrityResult.getOrThrow()
-            val sha256 = computeSha256Short(finalFile)
-            val refreshedTask = dao.getTaskById(taskId) ?: initialTask
-
-            // Save completed file to custom SAF directory (if configured) and Android MediaStore
-            val savedLocationNote = exportCompletedFileToMediaStore(finalFile, refreshedTask)
-
-            val finalCompleted = refreshedTask.copy(
-                totalBytes = finalFile.length(),
-                downloadedBytes = finalFile.length(),
-                durationMs = if (inspected.durationMs > 0) inspected.durationMs else refreshedTask.durationMs,
-                width = if (inspected.width > 0) inspected.width else refreshedTask.width,
-                height = if (inspected.height > 0) inspected.height else refreshedTask.height,
-                bitrateKbps = if (inspected.bitrateKbps > 0) inspected.bitrateKbps else refreshedTask.bitrateKbps,
-                speedBytesPerSec = 0L,
-                etaSeconds = 0L,
-                status = DownloadStatus.COMPLETED.name,
-                statusDetail = "$savedLocationNote • ${formatBytesStatic(finalFile.length())} • SHA-256: $sha256",
-                checksumSha256 = sha256,
-                completedAt = System.currentTimeMillis(),
-                errorMessage = null
-            )
-
-            dao.upsertTask(finalCompleted)
-            postCompletionNotification(finalCompleted)
-        } catch (ce: CancellationException) {
-            handlePauseOrCancelCleanup(taskId, initialTask, finalFile, primaryPartFile, secondaryAudioPartFile)
-            throw ce
-        } catch (e: Exception) {
-            if (pausedOrCancelledTasks.containsKey(taskId)) {
-                handlePauseOrCancelCleanup(taskId, initialTask, finalFile, primaryPartFile, secondaryAudioPartFile)
-                return@withContext
-            }
-            val currentDbTask = dao.getTaskById(taskId)
-            if (currentDbTask?.statusEnum == DownloadStatus.PAUSED || currentDbTask?.statusEnum == DownloadStatus.CANCELLED) {
-                handlePauseOrCancelCleanup(taskId, initialTask, finalFile, primaryPartFile, secondaryAudioPartFile)
-                return@withContext
-            }
-
-            // Remove incomplete output or empty/non-resumable temporary files on failure
-            runCatching {
-                if (finalFile.exists()) finalFile.delete()
-                if (secondaryAudioPartFile.exists()) secondaryAudioPartFile.delete()
-                if (primaryPartFile.exists() && (!initialTask.supportsRangeResume || primaryPartFile.length() == 0L)) {
+                    val convertedOk = MediaProcessorEngine.extractOrConvertAudio(
+                        sourceFile = primaryPartFile,
+                        outputFile = finalFile,
+                        targetFormat = targetFormat,
+                        sampleRateHz = activeTask.sampleRateHz.takeIf { it > 0 } ?: 44100,
+                        channelCount = if (activeTask.channelConfig.contains("Mono")) 1 else 2
+                    )
                     primaryPartFile.delete()
+                    if (!convertedOk) {
+                        if (finalFile.exists()) finalFile.delete()
+                        throw IllegalStateException(
+                            "Conversion failure: Could not convert or extract audio to ${targetFormat.label} (${targetFormat.codecDescription})."
+                        )
+                    }
+                } else {
+                    // Direct progressive stream move from temporary .part file to final target file
+                    finalFile.parentFile?.mkdirs()
+                    if (finalFile.exists()) finalFile.delete()
+                    if (!primaryPartFile.renameTo(finalFile)) {
+                        primaryPartFile.copyTo(finalFile, overwrite = true)
+                        primaryPartFile.delete()
+                    }
                 }
-            }
-            val latest = currentDbTask ?: initialTask
-            val preservedBytes = if (initialTask.supportsRangeResume && primaryPartFile.exists()) {
-                primaryPartFile.length()
-            } else {
-                latest.downloadedBytes
-            }
-            val readableError = formatDownloadExceptionMessage(e)
-            Log.w(TAG, "Download failed for source=$sanitizedUrl (${e::class.java.simpleName}): $readableError")
-            dao.upsertTask(
-                latest.copy(
-                    downloadedBytes = preservedBytes,
-                    status = DownloadStatus.FAILED.name,
-                    statusDetail = "Download failed",
-                    errorMessage = readableError,
+
+                // Stage 4: File-size & integrity validation + MediaExtractor post-inspection + MediaStore / SAF Save
+                dao.updateProgress(
+                    id = taskId,
+                    downloadedBytes = finalFile.length(),
+                    totalBytes = finalFile.length(),
                     speedBytesPerSec = 0L,
-                    etaSeconds = -1L
+                    etaSeconds = 0L,
+                    status = DownloadStatus.VALIDATING.name,
+                    statusDetail = "Verifying file integrity and saving to MediaStore..."
                 )
-            )
+
+                val integrityResult = MediaProcessorEngine.validateMediaFileIntegrity(finalFile)
+                if (integrityResult.isFailure) {
+                    val err = integrityResult.exceptionOrNull()
+                    if (finalFile.exists()) finalFile.delete()
+                    throw IllegalStateException(err?.message ?: "Downloaded file failed container integrity verification.")
+                }
+
+                val inspected = integrityResult.getOrThrow()
+                val sha256 = computeSha256Short(finalFile)
+                val refreshedTask = dao.getTaskById(taskId) ?: activeTask
+
+                // Save completed file to custom SAF directory (if configured) and Android MediaStore
+                val savedLocationNote = exportCompletedFileToMediaStore(finalFile, refreshedTask)
+                appendTaskLog(
+                    taskId,
+                    "Completed: ${finalFile.name} (${formatBytesStatic(finalFile.length())}, SHA-256=$sha256)"
+                )
+
+                val finalCompleted = refreshedTask.copy(
+                    totalBytes = finalFile.length(),
+                    downloadedBytes = finalFile.length(),
+                    durationMs = if (inspected.durationMs > 0) inspected.durationMs else refreshedTask.durationMs,
+                    width = if (inspected.width > 0) inspected.width else refreshedTask.width,
+                    height = if (inspected.height > 0) inspected.height else refreshedTask.height,
+                    bitrateKbps = if (inspected.bitrateKbps > 0) inspected.bitrateKbps else refreshedTask.bitrateKbps,
+                    speedBytesPerSec = 0L,
+                    etaSeconds = 0L,
+                    status = DownloadStatus.COMPLETED.name,
+                    statusDetail = "$savedLocationNote • ${formatBytesStatic(finalFile.length())} • SHA-256: $sha256",
+                    checksumSha256 = sha256,
+                    completedAt = System.currentTimeMillis(),
+                    errorMessage = null,
+                    technicalDetails = buildTechnicalDetailsForTask(taskId, refreshedTask, "SUCCESS (0)")
+                )
+
+                dao.upsertTask(finalCompleted)
+                postCompletionNotification(finalCompleted)
+                return@withContext
+            } catch (ce: CancellationException) {
+                handlePauseOrCancelCleanup(taskId, activeTask, finalFile, primaryPartFile, secondaryAudioPartFile)
+                throw ce
+            } catch (e: Exception) {
+                lastException = e
+                if (pausedOrCancelledTasks.containsKey(taskId)) {
+                    handlePauseOrCancelCleanup(taskId, activeTask, finalFile, primaryPartFile, secondaryAudioPartFile)
+                    return@withContext
+                }
+                val currentDbTask = dao.getTaskById(taskId)
+                if (currentDbTask?.statusEnum == DownloadStatus.PAUSED || currentDbTask?.statusEnum == DownloadStatus.CANCELLED) {
+                    handlePauseOrCancelCleanup(taskId, activeTask, finalFile, primaryPartFile, secondaryAudioPartFile)
+                    return@withContext
+                }
+
+                val errMsg = e.message.orEmpty()
+                appendTaskLog(taskId, "Attempt $jobAttempt/$maxJobAttempts failed (${e.javaClass.simpleName}): $errMsg")
+
+                val isNonRetryablePreFlight = e is IllegalArgumentException ||
+                    errMsg.contains("ENOSPC", ignoreCase = true) ||
+                    errMsg.contains("Insufficient storage", ignoreCase = true) ||
+                    errMsg.contains("Wi-Fi Only", ignoreCase = true) ||
+                    errMsg.contains("HTML webpage", ignoreCase = true) ||
+                    errMsg.contains("JSON response", ignoreCase = true)
+
+                if (!isNonRetryablePreFlight && jobAttempt < maxJobAttempts) {
+                    val preserved = if (primaryPartFile.exists()) primaryPartFile.length() else activeTask.downloadedBytes
+                    dao.updateProgress(
+                        id = taskId,
+                        downloadedBytes = preserved,
+                        totalBytes = activeTask.totalBytes.coerceAtLeast(preserved),
+                        speedBytesPerSec = 0L,
+                        etaSeconds = -1L,
+                        status = DownloadStatus.DOWNLOADING.name,
+                        statusDetail = "Stream interrupted • Auto-retrying ($jobAttempt of ${maxJobAttempts - 1}) in 3s..."
+                    )
+                    delay(3000L)
+                    continue
+                }
+                break
+            }
         }
+
+        val finalEx = lastException ?: IOException("Download failed after $maxJobAttempts attempts.")
+        if (pausedOrCancelledTasks.containsKey(taskId)) {
+            handlePauseOrCancelCleanup(taskId, activeTask, finalFile, primaryPartFile, secondaryAudioPartFile)
+            return@withContext
+        }
+        val currentDbTask = dao.getTaskById(taskId)
+        if (currentDbTask?.statusEnum == DownloadStatus.PAUSED || currentDbTask?.statusEnum == DownloadStatus.CANCELLED) {
+            handlePauseOrCancelCleanup(taskId, activeTask, finalFile, primaryPartFile, secondaryAudioPartFile)
+            return@withContext
+        }
+
+        // Remove incomplete output or empty/non-resumable temporary files on failure
+        runCatching {
+            if (finalFile.exists()) finalFile.delete()
+            if (secondaryAudioPartFile.exists()) secondaryAudioPartFile.delete()
+            if (primaryPartFile.exists() && (!activeTask.supportsRangeResume || primaryPartFile.length() == 0L)) {
+                primaryPartFile.delete()
+            }
+        }
+        val latest = currentDbTask ?: activeTask
+        val preservedBytes = if (activeTask.supportsRangeResume && primaryPartFile.exists()) {
+            primaryPartFile.length()
+        } else {
+            latest.downloadedBytes
+        }
+        val rawError = formatDownloadExceptionMessage(finalEx)
+        val isYouTubeTask = !ytVideoId.isNullOrBlank() ||
+            latest.platformName.equals("YouTube", ignoreCase = true) ||
+            latest.sourceUrl.contains("googlevideo.com", ignoreCase = true) ||
+            latest.sourceUrl.contains("youtube.com", ignoreCase = true)
+        val readableError = if (isYouTubeTask &&
+            (rawError.contains("403") || rawError.contains("not a bot", ignoreCase = true) || rawError.contains("private", ignoreCase = true))
+        ) {
+            SocialStreamExtractor.mapYouTubeFailureMessage(rawError, ytVideoId).second
+        } else {
+            rawError
+        }
+        val techDetails = buildTechnicalDetailsForTask(taskId, latest, readableError)
+        Log.w(TAG, "Download failed for source=$sanitizedUrl (${finalEx::class.java.simpleName}): $readableError")
+        dao.upsertTask(
+            latest.copy(
+                downloadedBytes = preservedBytes,
+                status = DownloadStatus.FAILED.name,
+                statusDetail = "Download failed",
+                errorMessage = readableError,
+                technicalDetails = techDetails,
+                speedBytesPerSec = 0L,
+                etaSeconds = -1L
+            )
+        )
     }
 
     private suspend fun handlePauseOrCancelCleanup(
@@ -1230,13 +1432,19 @@ class DownloadEngine(
                 val activeResponse = if (initialResponse.code in listOf(401, 403, 410)) {
                     val initialCode = initialResponse.code
                     initialResponse.close()
+                    appendTaskLog(
+                        taskId,
+                        "HTTP $initialCode at offset=$currentOffset (host=$host, stage=${if (baseByteOffset == 0L) "primary" else "secondary-audio"})"
+                    )
 
-                    // Step A: For 401/403, try alternative User-Agent / Range / Referer header profiles on the same URL
-                    val altResponse = if (initialCode != 410) {
+                    // Step A: For non-googlevideo 401/403, try alternative User-Agent / Referer profiles on the same URL.
+                    // Never send mismatched TikTok/Facebook/iOS User-Agents to googlevideo.com as its URL signature binds `c=`.
+                    val altResponse = if (initialCode != 410 && !isGoogleVideo) {
                         tryAlternativeHeaderProfiles(cleanUrl, currentOffset, requestedWindowEnd, supportsResume)
                     } else null
 
                     if (altResponse != null) {
+                        appendTaskLog(taskId, "Alternative header profile succeeded with HTTP ${altResponse.code}")
                         altResponse
                     } else {
                         // Step B: Resolve a fresh non-expired stream URL from fallbacks or extractor
@@ -1248,6 +1456,7 @@ class DownloadEngine(
                             recoveryDepth = activeRecoveryDepth
                         )
                         if (!freshUrl.isNullOrBlank()) {
+                            appendTaskLog(taskId, "Refreshed stream URL (recoveryDepth=${activeRecoveryDepth + 1}); resuming at offset=$currentOffset")
                             activeSourceUrl = freshUrl
                             cleanUrl = normalizeStreamUrl(activeSourceUrl)
                             activeRecoveryDepth++
@@ -1430,6 +1639,10 @@ class DownloadEngine(
                 }
 
                 if (streamCompleted) {
+                    appendTaskLog(
+                        taskId,
+                        "Stream transfer finished (${formatBytesStatic(currentOffset)}, stage=${if (baseByteOffset == 0L) "primary" else "secondary-audio"})"
+                    )
                     break
                 }
             } catch (ce: CancellationException) {
@@ -1464,6 +1677,7 @@ class DownloadEngine(
 
                 if (supportsResume && !isPermanentHttpError && consecutiveFailures <= 5 && currentDiskLen > 0L) {
                     Log.i(TAG, "Stream interrupted at $currentDiskLen bytes (attempt $consecutiveFailures). Auto-resuming via HTTP Range...")
+                    appendTaskLog(taskId, "Transient I/O drop at $currentDiskLen bytes (attempt $consecutiveFailures); auto-resuming via HTTP Range")
                     if (!pausedOrCancelledTasks.containsKey(taskId)) {
                         dao.updateProgress(
                             id = taskId,
@@ -1533,17 +1747,21 @@ class DownloadEngine(
             )
         }
 
-        val queuedFallbacks = taskFallbackUrls[taskId].orEmpty()
-        val nextQueuedFallback = queuedFallbacks.firstOrNull {
-            normalizeStreamUrl(it) != cleanFailedUrl &&
-                !SocialStreamExtractor.isStreamUrlExpired(it)
-        }
-        if (nextQueuedFallback != null) {
-            taskFallbackUrls[taskId] = queuedFallbacks.filter { it != nextQueuedFallback }
-            if (currentTask != null && baseByteOffset == 0L) {
-                dao.upsertTask(currentTask.copy(sourceUrl = nextQueuedFallback))
+        // Only use queued fallback URLs for the primary stream (baseByteOffset == 0L).
+        // When baseByteOffset > 0L, we are downloading Stage 2 secondaryAudioUrl and must resolve an audio URL!
+        if (baseByteOffset == 0L) {
+            val queuedFallbacks = taskFallbackUrls[taskId].orEmpty()
+            val nextQueuedFallback = queuedFallbacks.firstOrNull {
+                normalizeStreamUrl(it) != cleanFailedUrl &&
+                    !SocialStreamExtractor.isStreamUrlExpired(it)
             }
-            return nextQueuedFallback
+            if (nextQueuedFallback != null) {
+                taskFallbackUrls[taskId] = queuedFallbacks.filter { it != nextQueuedFallback }
+                if (currentTask != null) {
+                    dao.upsertTask(currentTask.copy(sourceUrl = nextQueuedFallback))
+                }
+                return nextQueuedFallback
+            }
         }
 
         val freshUrl = SocialStreamExtractor.resolveFreshStreamUrlOn403(
@@ -1580,21 +1798,6 @@ class DownloadEngine(
         }
         val candidateProfiles = listOf(
             mapOf(
-                "User-Agent" to "com.google.android.apps.youtube.vr.oculus/1.62.27 (Linux; U; Android 12L; en_US; eureka-user Build/SQ3A.220605.009.A1) gzip",
-                "Accept" to "*/*",
-                "Range" to rangeVal
-            ),
-            mapOf(
-                "User-Agent" to "com.google.ios.youtube/20.03.02 (iPhone16,2; U; CPU iOS 18_2_1 like Mac OS X;)",
-                "Accept" to "*/*",
-                "Range" to rangeVal
-            ),
-            mapOf(
-                "User-Agent" to "com.google.android.youtube/1.9 (Linux; U; Android 12; en_US) gzip",
-                "Accept" to "*/*",
-                "Range" to rangeVal
-            ),
-            mapOf(
                 "User-Agent" to SocialStreamExtractor.MOBILE_USER_AGENT,
                 "Accept" to "*/*",
                 "Referer" to "https://www.tikwm.com/"
@@ -1613,12 +1816,6 @@ class DownloadEngine(
                 "User-Agent" to SocialStreamExtractor.DESKTOP_USER_AGENT,
                 "Accept" to "*/*",
                 "Referer" to "https://www.instagram.com/"
-            ),
-            mapOf(
-                "User-Agent" to SocialStreamExtractor.DESKTOP_USER_AGENT,
-                "Accept" to "*/*",
-                "Origin" to "https://www.youtube.com",
-                "Referer" to "https://www.youtube.com/"
             )
         )
         for (headers in candidateProfiles) {
@@ -1642,6 +1839,201 @@ class DownloadEngine(
             }
         }
         return null
+    }
+
+    /**
+     * Runs an end-to-end self-diagnostic that verifies:
+     * 1. Extractor engine & Android/OkHttp runtime version,
+     * 2. Android MediaMuxer + MediaExtractor availability,
+     * 3. A REAL extraction and full download of `https://www.youtube.com/watch?v=jNQXAC9IVRw`
+     *    ("Me at the zoo", 19s) into a temporary file, verifying MP4 container integrity and deleting
+     *    the temporary file afterwards.
+     */
+    suspend fun runDiagnostics(): DiagnosticsReport = withContext(Dispatchers.IO) {
+        val testUrl = "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+        val testVideoId = "jNQXAC9IVRw"
+        val logs = mutableListOf<String>()
+        fun logLine(msg: String) {
+            val ts = SimpleDateFormat("HH:mm:ss.SSS", Locale.US).format(Date())
+            logs.add("[$ts] $msg")
+        }
+
+        val extractorVer = SocialStreamExtractor.EXTRACTOR_ENGINE_VERSION
+        logLine("Extractor: $extractorVer")
+        logLine("Runtime: Android API ${Build.VERSION.SDK_INT} (${Build.MODEL}) • OkHttp 4.12")
+
+        // Check MediaMuxer availability
+        val muxerProbeFile = File(context.cacheDir, "diag_muxer_probe_${System.currentTimeMillis()}.mp4")
+        val muxerAvailable = try {
+            val muxer = android.media.MediaMuxer(
+                muxerProbeFile.absolutePath,
+                android.media.MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4
+            )
+            muxer.release()
+            true
+        } catch (e: Exception) {
+            logLine("MediaMuxer probe warning: ${e.javaClass.simpleName}: ${e.message}")
+            false
+        } finally {
+            runCatching { muxerProbeFile.delete() }
+        }
+        val muxerStatus = if (muxerAvailable) {
+            "Available (Android MediaMuxer MPEG-4 + MediaExtractor)"
+        } else {
+            "Unavailable"
+        }
+        logLine("Muxer check: $muxerStatus")
+
+        val tempVideoPart = File(context.cacheDir, "diag_${testVideoId}_${System.currentTimeMillis()}.part")
+        val tempAudioPart = File(context.cacheDir, "diag_${testVideoId}_${System.currentTimeMillis()}.audio.part")
+        val tempFinalFile = File(context.cacheDir, "diag_${testVideoId}_${System.currentTimeMillis()}.mp4")
+
+        val startTime = System.currentTimeMillis()
+        var exitCode = -1
+        var statusSummary = "Failed"
+        var downloadedBytes = 0L
+
+        try {
+            logLine("Extracting YouTube streams for $testUrl ...")
+            val freshStreams = SocialStreamExtractor.extractFreshYouTubeTaskStreams(
+                httpClient = httpClient,
+                videoId = testVideoId,
+                isAudioMode = false,
+                preferredHeight = 360,
+                preferProgressiveFallback = true
+            )
+            logs.addAll(SocialStreamExtractor.getDiagnosticLog(testVideoId).takeLast(6))
+
+            if (freshStreams == null) {
+                val (errTitle, errMsg) = SocialStreamExtractor.mapYouTubeFailureMessage(
+                    SocialStreamExtractor.getLastPlayabilityReason(testVideoId),
+                    testVideoId
+                )
+                logLine("Extraction failed: $errTitle — $errMsg")
+                exitCode = 1
+                statusSummary = "$errTitle: $errMsg"
+            } else {
+                val cleanPrimary = normalizeStreamUrl(freshStreams.primaryUrl)
+                val itag = Regex("[?&]itag=(\\d+)(?:&|$)").find(cleanPrimary)?.groupValues?.getOrNull(1) ?: "unknown"
+                val clientParam = Regex("[?&]c=([^&]+)").find(cleanPrimary)?.groupValues?.getOrNull(1) ?: "proxy"
+                logLine("Resolved stream itag=$itag, client=$clientParam, merge=${freshStreams.requiresStreamMerge}")
+
+                // Download primary stream into tempVideoPart using 4 MB Range window
+                downloadDiagnosticStreamToFile(cleanPrimary, tempVideoPart) { msg -> logLine(msg) }
+
+                if (freshStreams.requiresStreamMerge && !freshStreams.secondaryAudioUrl.isNullOrBlank()) {
+                    val cleanAudio = normalizeStreamUrl(freshStreams.secondaryAudioUrl)
+                    logLine("Downloading paired audio stream...")
+                    downloadDiagnosticStreamToFile(cleanAudio, tempAudioPart) { msg -> logLine(msg) }
+                    logLine("Merging video (${formatBytesStatic(tempVideoPart.length())}) + audio (${formatBytesStatic(tempAudioPart.length())})...")
+                    val merged = MediaProcessorEngine.mergeVideoAndAudioStreams(tempVideoPart, tempAudioPart, tempFinalFile)
+                    if (!merged) {
+                        throw IOException("MediaMuxer failed to merge diagnostic video + audio tracks.")
+                    }
+                } else {
+                    tempVideoPart.copyTo(tempFinalFile, overwrite = true)
+                }
+
+                downloadedBytes = tempFinalFile.length()
+                val integrity = MediaProcessorEngine.validateMediaFileIntegrity(tempFinalFile)
+                if (integrity.isSuccess && downloadedBytes > 0L) {
+                    val meta = integrity.getOrThrow()
+                    exitCode = 0
+                    statusSummary = "HEALTHY • Downloaded ${formatBytesStatic(downloadedBytes)} (${meta.width}x${meta.height}, ${meta.durationMs / 1000}s) • Exit 0"
+                    logLine("Integrity verified: ${formatBytesStatic(downloadedBytes)}, ${meta.width}x${meta.height}, duration=${meta.durationMs}ms")
+                    logLine("Diagnostics test download succeeded (exitCode=0). Cleaning up temp file.")
+                } else {
+                    val reason = integrity.exceptionOrNull()?.message ?: "Empty or invalid container"
+                    exitCode = 2
+                    statusSummary = "Container verification failed: $reason"
+                    logLine("Verification failed (exitCode=2): $reason")
+                }
+            }
+        } catch (e: Exception) {
+            exitCode = 3
+            val mapped = if (e.message?.contains("403") == true) {
+                SocialStreamExtractor.mapYouTubeFailureMessage(e.message, testVideoId).second
+            } else {
+                formatDownloadExceptionMessage(e)
+            }
+            statusSummary = mapped
+            logLine("Diagnostic download exception (exitCode=3): ${e.javaClass.simpleName}: $mapped")
+        } finally {
+            runCatching { tempVideoPart.delete() }
+            runCatching { tempAudioPart.delete() }
+            runCatching { tempFinalFile.delete() }
+        }
+
+        val elapsed = (System.currentTimeMillis() - startTime).coerceAtLeast(1L)
+        DiagnosticsReport(
+            isHealthy = exitCode == 0,
+            extractorVersion = extractorVer,
+            muxerStatus = muxerStatus,
+            testVideoUrl = testUrl,
+            exitCode = exitCode,
+            statusSummary = statusSummary,
+            downloadedBytes = downloadedBytes,
+            durationMs = elapsed,
+            logLines = logs.takeLast(15)
+        )
+    }
+
+    private fun downloadDiagnosticStreamToFile(
+        cleanUrl: String,
+        targetFile: File,
+        onLog: (String) -> Unit
+    ) {
+        val host = runCatching { URI(cleanUrl).host?.lowercase() }.getOrNull().orEmpty()
+        val isGoogleVideo = host.contains("googlevideo.com")
+        val urlClen = Regex("[?&]clen=(\\d+)").find(cleanUrl)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: -1L
+        var trackTotal = urlClen
+        var offset = 0L
+        val windowSize = 4L * 1024L * 1024L
+
+        RandomAccessFile(targetFile, "rw").use { raf ->
+            raf.setLength(0L)
+            while (true) {
+                val endByte = if (isGoogleVideo) {
+                    if (trackTotal > 0L) minOf(offset + windowSize - 1L, trackTotal - 1L) else offset + windowSize - 1L
+                } else -1L
+                val reqBuilder = Request.Builder().url(cleanUrl).get()
+                for ((k, v) in SocialStreamExtractor.buildStreamRequestHeaders(cleanUrl)) {
+                    reqBuilder.header(k, v)
+                }
+                if (isGoogleVideo && endByte >= offset) {
+                    reqBuilder.header("Range", "bytes=$offset-$endByte")
+                }
+                httpClient.newCall(reqBuilder.build()).execute().use { resp ->
+                    onLog("HTTP GET ${host.ifEmpty { "stream" }} (offset=$offset) -> HTTP ${resp.code}")
+                    if (!resp.isSuccessful) {
+                        throw IOException("HTTP ${resp.code} from $host during diagnostic download")
+                    }
+                    val contentRangeTotal = parseContentRangeTotal(resp.header("Content-Range"))
+                    if (contentRangeTotal > 0L) trackTotal = contentRangeTotal
+                    val body = resp.body ?: throw IOException("Empty response body")
+                    val contentLen = body.contentLength()
+                    if (resp.code != 206 && contentLen > 0L) {
+                        trackTotal = contentLen
+                    }
+                    var chunkRead = 0L
+                    body.byteStream().use { ins ->
+                        val buf = ByteArray(64 * 1024)
+                        while (true) {
+                            val r = ins.read(buf)
+                            if (r == -1) break
+                            raf.write(buf, 0, r)
+                            offset += r
+                            chunkRead += r
+                        }
+                    }
+                    val done = resp.code != 206 ||
+                        (trackTotal > 0L && offset >= trackTotal) ||
+                        !isGoogleVideo ||
+                        (endByte >= 0L && chunkRead < (endByte - (offset - chunkRead) + 1L))
+                    if (done) break
+                }
+            }
+        }
     }
 
     private fun ensureUniqueFileName(desiredName: String): String {

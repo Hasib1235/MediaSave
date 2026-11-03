@@ -159,6 +159,8 @@ fun MediaSaveAppRoot(viewModel: MediaSaveViewModel) {
     val activeVideoPlayback by viewModel.activeVideoPlayback.collectAsStateWithLifecycle()
     val showFullMusicPlayer by viewModel.showFullMusicPlayer.collectAsStateWithLifecycle()
     val audioPlayerState by viewModel.audioPlayerState.collectAsStateWithLifecycle()
+    val diagnosticsReport by viewModel.diagnosticsReport.collectAsStateWithLifecycle()
+    val isRunningDiagnostics by viewModel.isRunningDiagnostics.collectAsStateWithLifecycle()
 
     val snackbarHostState = remember { SnackbarHostState() }
     val drawerState = rememberDrawerState(initialValue = DrawerValue.Closed)
@@ -370,7 +372,8 @@ fun MediaSaveAppRoot(viewModel: MediaSaveViewModel) {
                                     coroutineScope.launch { drawerState.open() }
                                 },
                                 onDeleteTask = viewModel::deleteTask,
-                                onShareTask = viewModel::shareDownloadedFile
+                                onShareTask = viewModel::shareDownloadedFile,
+                                onRunDiagnostics = viewModel::runDiagnostics
                             )
 
                             MediaSaveDestination.QUEUE -> DownloadsQueueScreen(
@@ -423,6 +426,7 @@ fun MediaSaveAppRoot(viewModel: MediaSaveViewModel) {
                                 onClearCompletedHistory = viewModel::clearFinishedHistory,
                                 onOpenPrivacyPolicy = { showPrivacyPolicyDialog = true },
                                 onOpenAbout = { showAboutDialog = true },
+                                onRunDiagnostics = viewModel::runDiagnostics,
                                 onShowMessage = viewModel::showMessage
                             )
                         }
@@ -501,6 +505,7 @@ fun MediaSaveAppRoot(viewModel: MediaSaveViewModel) {
             sharedUrl = shareErrorState.url,
             errorTitle = shareErrorState.errorTitle,
             errorMessage = shareErrorState.userMessage,
+            technicalDetail = shareErrorState.technicalDetail,
             onRetry = { viewModel.analyzeCurrentUrl(isFromShareIntent = true) },
             onDismissToHome = viewModel::dismissShareIntentFlow
         )
@@ -551,5 +556,14 @@ fun MediaSaveAppRoot(viewModel: MediaSaveViewModel) {
 
     if (showPrivacyPolicyDialog) {
         PrivacyPolicyDialog(onDismiss = { showPrivacyPolicyDialog = false })
+    }
+
+    if (isRunningDiagnostics || diagnosticsReport != null) {
+        com.example.ui.components.DiagnosticsReportDialog(
+            report = diagnosticsReport,
+            isRunning = isRunningDiagnostics,
+            onRunAgain = viewModel::runDiagnostics,
+            onDismiss = viewModel::dismissDiagnosticsReport
+        )
     }
 }

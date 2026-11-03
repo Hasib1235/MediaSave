@@ -602,10 +602,19 @@ class YouTubePlatformAdapter(
         }
 
         if (videoStreams.isEmpty() && audioStreams.isEmpty()) {
+            val (errTitle, errMsg) = SocialStreamExtractor.mapYouTubeFailureMessage(
+                rawReasonOrError = SocialStreamExtractor.getLastPlayabilityReason(videoId),
+                videoIdOrUrl = videoId
+            )
+            val techDetails = SocialStreamExtractor.getDiagnosticLog(videoId)
+                .takeLast(20)
+                .joinToString("\n")
+                .ifBlank { "videoId=$videoId • Engine=${SocialStreamExtractor.EXTRACTOR_ENGINE_VERSION}" }
             return@withContext MediaAnalysisState.Error(
                 url = url,
-                errorTitle = "Stream Extraction Failed",
-                userMessage = "Could not extract playable video or audio streams for this YouTube link. Please verify the video is public and not age-restricted."
+                errorTitle = errTitle,
+                userMessage = errMsg,
+                technicalDetail = techDetails
             )
         }
 
