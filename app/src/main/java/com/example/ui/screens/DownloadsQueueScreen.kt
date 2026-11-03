@@ -163,7 +163,7 @@ private fun Screen6DownloadingProgressView(
                 Text(
                     text = "Downloading",
                     style = MaterialTheme.typography.titleLarge,
-                    color = Color.White,
+                    color = MaterialTheme.colorScheme.onBackground,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.align(Alignment.Center)
                 )
@@ -499,7 +499,7 @@ private fun Screen6DownloadingProgressView(
                 Text(
                     text = "Queue (${queueList.size})",
                     style = MaterialTheme.typography.titleMedium,
-                    color = Color.White,
+                    color = MaterialTheme.colorScheme.onBackground,
                     fontWeight = FontWeight.Bold
                 )
                 TextButton(
@@ -680,7 +680,7 @@ private fun Screen7DownloadsLibraryView(
                 Text(
                     text = "Downloads",
                     style = MaterialTheme.typography.titleLarge,
-                    color = Color.White,
+                    color = MaterialTheme.colorScheme.onBackground,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.align(Alignment.Center)
                 )

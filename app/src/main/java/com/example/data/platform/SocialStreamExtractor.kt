@@ -543,9 +543,6 @@ object SocialStreamExtractor {
             host.contains("facebook") || host.contains("fbcdn") || host.contains("fbsbx") -> {
                 headers["Referer"] = "https://www.facebook.com/"
             }
-            host.contains("oceansaver") || host.contains("ddownr") || host.contains("savenow") -> {
-                headers["Referer"] = "https://ddownr.com/"
-            }
             isDirectGoogleVideo && (lowerUrl.contains("c=web") || lowerUrl.contains("c=mweb") || lowerUrl.contains("c=tvhtml5")) -> {
                 headers["Origin"] = "https://www.youtube.com"
                 headers["Referer"] = "https://www.youtube.com/"
@@ -1096,7 +1093,7 @@ object SocialStreamExtractor {
     }
 
     /**
-     * Layer 2 & 3: Public Invidious (with local=true proxy support), Piped, and OceanSaver/Cobalt Resolvers
+     * Layer 2 & 3: Public Piped and Invidious (with local=true proxy support) Resolvers
      */
     fun extractYouTubeViaPipedOrInvidious(httpClient: OkHttpClient, videoId: String): ExtractedSocialStreams? {
         // Sub-layer A: Piped API instances (fast proxy streams that work even when datacenter IPs are blocked)
@@ -1384,94 +1381,6 @@ object SocialStreamExtractor {
         return null
     }
 
-    private fun extractYouTubeViaOceanSaver(
-        httpClient: OkHttpClient,
-        videoId: String,
-        preferredFormat: String = "720"
-    ): ExtractedSocialStreams? {
-        return try {
-            val ytUrl = URLEncoder.encode("https://www.youtube.com/watch?v=$videoId", "UTF-8")
-            val initUrl = "https://p.oceansaver.in/ajax/download.php?format=$preferredFormat&url=$ytUrl&api=dfcb6d76f2f6a9894gjkege8a4ab232222"
-            val req = Request.Builder()
-                .url(initUrl)
-                .header("User-Agent", DESKTOP_USER_AGENT)
-                .header("Referer", "https://ddownr.com/")
-                .get()
-                .build()
-
-            var taskId: String? = null
-            var title = "YouTube Video"
-            var thumb: String? = "https://i.ytimg.com/vi/$videoId/hqdefault.jpg"
-
-            httpClient.newCall(req).execute().use { resp ->
-                if (!resp.isSuccessful) return null
-                val json = JSONObject(resp.body?.string().orEmpty())
-                if (!json.optBoolean("success", false)) return null
-                taskId = json.optString("id").takeIf { it.isNotBlank() }
-                title = json.optString("title", title)
-                thumb = json.optJSONObject("info")?.optString("image") ?: thumb
-            }
-
-            val id = taskId ?: return null
-            var downloadUrl: String? = null
-            for (attempt in 0 until 10) {
-                Thread.sleep(600)
-                val pollReq = Request.Builder()
-                    .url("https://p.oceansaver.in/ajax/progress.php?id=$id")
-                    .header("User-Agent", DESKTOP_USER_AGENT)
-                    .header("Referer", "https://ddownr.com/")
-                    .get()
-                    .build()
-                httpClient.newCall(pollReq).execute().use { pollResp ->
-                    if (pollResp.isSuccessful) {
-                        val pollJson = JSONObject(pollResp.body?.string().orEmpty())
-                        val candidate = pollJson.optString("download_url").takeIf { it.startsWith("http") }
-                        if (candidate != null) {
-                            downloadUrl = candidate
-                        }
-                    }
-                }
-                if (downloadUrl != null) break
-            }
-
-            val finalStreamUrl = downloadUrl?.let { appendVideoIdFragment(it, videoId) } ?: return null
-            val videoStreams = listOf(
-                VideoStreamOption(
-                    id = "ocean_720p_hd",
-                    resolutionHeight = 720,
-                    resolutionWidth = 1280,
-                    resolutionLabel = "720p HD",
-                    videoCodec = "H.264 (AVC1)",
-                    audioCodec = "AAC-LC",
-                    container = VideoContainerFormat.MP4,
-                    streamType = StreamType.PROGRESSIVE,
-                    frameRate = 30,
-                    isHdr = false,
-                    bitrateKbps = 1500,
-                    estimatedSizeBytes = 0L,
-                    downloadUrl = finalStreamUrl
-                )
-            )
-            val audioStreams = listOf(
-                AudioStreamOption(
-                    id = "ocean_audio_m4a",
-                    sourceFormat = AudioFormat.M4A,
-                    sourceCodec = "AAC-LC (Demuxed from MP4)",
-                    bitrateKbps = 192,
-                    sampleRateHz = 44100,
-                    channelCount = 2,
-                    isLosslessSource = false,
-                    estimatedSizeBytes = 0L,
-                    downloadUrl = finalStreamUrl,
-                    isExtractedFromVideo = true
-                )
-            )
-            ExtractedSocialStreams(title, "YouTube Creator", 0L, thumb, videoStreams, audioStreams)
-        } catch (_: Exception) {
-            null
-        }
-    }
-
     /**
      * Automatically resolves a fresh, non-403 stream URL when a previously extracted CDN link
      * expires or returns HTTP 401/403/410 during download execution.
@@ -1622,135 +1531,6 @@ object SocialStreamExtractor {
         }
 
         return null
-    }
-
-    /**
-     * Provides resilient multi-resolution stream descriptors when a cloud container IP is rate-limited
-     * or challenged by YouTube/Meta anti-bot walls during stream analysis.
-     */
-    fun buildCloudFallbackStreams(
-        sourceUrl: String,
-        title: String,
-        author: String,
-        thumbnailUrl: String?,
-        durationMs: Long = 30_000L
-    ): ExtractedSocialStreams {
-        val cleanSource = stripUrlFragment(sourceUrl)
-        val durationSec = (durationMs / 1000L).coerceAtLeast(15L)
-        val videoStreams = listOf(
-            VideoStreamOption(
-                id = "social_fallback_360p",
-                resolutionHeight = 360,
-                resolutionWidth = 640,
-                resolutionLabel = "360p SD",
-                videoCodec = "H.264 (AVC1)",
-                audioCodec = "AAC-LC",
-                container = VideoContainerFormat.MP4,
-                streamType = StreamType.PROGRESSIVE,
-                frameRate = 30,
-                isHdr = false,
-                bitrateKbps = 650,
-                estimatedSizeBytes = durationSec * 82_000L,
-                downloadUrl = "$cleanSource#fallback_res=360p"
-            ),
-            VideoStreamOption(
-                id = "social_fallback_480p",
-                resolutionHeight = 480,
-                resolutionWidth = 854,
-                resolutionLabel = "480p SD",
-                videoCodec = "H.264 (AVC1)",
-                audioCodec = "AAC-LC",
-                container = VideoContainerFormat.MP4,
-                streamType = StreamType.PROGRESSIVE,
-                frameRate = 30,
-                isHdr = false,
-                bitrateKbps = 1100,
-                estimatedSizeBytes = durationSec * 140_000L,
-                downloadUrl = "$cleanSource#fallback_res=480p"
-            ),
-            VideoStreamOption(
-                id = "social_fallback_720p",
-                resolutionHeight = 720,
-                resolutionWidth = 1280,
-                resolutionLabel = "720p HD",
-                videoCodec = "H.264 (AVC1)",
-                audioCodec = "AAC-LC",
-                container = VideoContainerFormat.MP4,
-                streamType = StreamType.PROGRESSIVE,
-                frameRate = 30,
-                isHdr = false,
-                bitrateKbps = 1800,
-                estimatedSizeBytes = durationSec * 225_000L,
-                downloadUrl = "$cleanSource#fallback_res=720p"
-            ),
-            VideoStreamOption(
-                id = "social_fallback_1080p",
-                resolutionHeight = 1080,
-                resolutionWidth = 1920,
-                resolutionLabel = "1080p FHD",
-                videoCodec = "H.264 (AVC1)",
-                audioCodec = "AAC-LC",
-                container = VideoContainerFormat.MP4,
-                streamType = StreamType.PROGRESSIVE,
-                frameRate = 60,
-                isHdr = false,
-                bitrateKbps = 4200,
-                estimatedSizeBytes = durationSec * 525_000L,
-                downloadUrl = "$cleanSource#fallback_res=1080p"
-            ),
-            VideoStreamOption(
-                id = "social_fallback_1440p",
-                resolutionHeight = 1440,
-                resolutionWidth = 2560,
-                resolutionLabel = "1440p QHD",
-                videoCodec = "H.264 (AVC1)",
-                audioCodec = "AAC-LC",
-                container = VideoContainerFormat.MP4,
-                streamType = StreamType.PROGRESSIVE,
-                frameRate = 60,
-                isHdr = false,
-                bitrateKbps = 8000,
-                estimatedSizeBytes = durationSec * 1_000_000L,
-                downloadUrl = "$cleanSource#fallback_res=1440p"
-            ),
-            VideoStreamOption(
-                id = "social_fallback_2160p",
-                resolutionHeight = 2160,
-                resolutionWidth = 3840,
-                resolutionLabel = "2160p 4K",
-                videoCodec = "H.264 (AVC1)",
-                audioCodec = "AAC-LC",
-                container = VideoContainerFormat.MP4,
-                streamType = StreamType.PROGRESSIVE,
-                frameRate = 60,
-                isHdr = false,
-                bitrateKbps = 16000,
-                estimatedSizeBytes = durationSec * 2_000_000L,
-                downloadUrl = "$cleanSource#fallback_res=2160p"
-            )
-        )
-        val audioStreams = listOf(
-            AudioStreamOption(
-                id = "social_fallback_audio_m4a",
-                sourceFormat = AudioFormat.M4A,
-                sourceCodec = "AAC-LC (High Quality Audio)",
-                bitrateKbps = 192,
-                sampleRateHz = 44100,
-                channelCount = 2,
-                isLosslessSource = false,
-                estimatedSizeBytes = durationSec * 24_000L,
-                downloadUrl = "$cleanSource#fallback_res=audio",
-                isExtractedFromVideo = true
-            )
-        )
-        return ExtractedSocialStreams(
-            title = title,
-            author = author,
-            durationMs = durationSec * 1000L,
-            thumbnailUrl = thumbnailUrl,
-            videoStreams = videoStreams,
-            audioStreams = audioStreams
-        )
     }
 
     // =========================================================================

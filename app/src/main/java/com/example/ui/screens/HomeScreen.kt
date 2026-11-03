@@ -152,7 +152,7 @@ fun HomeScreen(
                         Icon(
                             imageVector = Icons.Default.Menu,
                             contentDescription = "Open Menu",
-                            tint = Color.White
+                            tint = MaterialTheme.colorScheme.onBackground
                         )
                     }
 
@@ -181,7 +181,7 @@ fun HomeScreen(
                         Icon(
                             imageVector = Icons.Default.Settings,
                             contentDescription = "Settings",
-                            tint = Color.White
+                            tint = MaterialTheme.colorScheme.onBackground
                         )
                     }
                 }
@@ -354,7 +354,7 @@ fun HomeScreen(
                                     Text(
                                         text = analysisState.userMessage,
                                         style = MaterialTheme.typography.bodySmall,
-                                        color = Color.White
+                                        color = MaterialTheme.colorScheme.onSurface
                                     )
                                 }
                             }
@@ -376,7 +376,7 @@ fun HomeScreen(
                                         Text(
                                             text = "${analysisState.platform.displayName} Restriction Notice",
                                             style = MaterialTheme.typography.titleSmall,
-                                            color = Color.White,
+                                            color = MaterialTheme.colorScheme.onSurface,
                                             fontWeight = FontWeight.Bold
                                         )
                                     }
@@ -384,7 +384,7 @@ fun HomeScreen(
                                     Text(
                                         text = analysisState.restrictionReason,
                                         style = MaterialTheme.typography.bodySmall,
-                                        color = Color.White
+                                        color = MaterialTheme.colorScheme.onSurface
                                     )
                                     Spacer(modifier = Modifier.height(6.dp))
                                     Text(
@@ -634,7 +634,7 @@ fun HomeScreen(
                     Text(
                         text = "Recent Downloads",
                         style = MaterialTheme.typography.titleMedium,
-                        color = Color.White,
+                        color = MaterialTheme.colorScheme.onBackground,
                         fontWeight = FontWeight.Bold
                     )
                     TextButton(

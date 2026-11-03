@@ -17,6 +17,8 @@ private val Context.dataStore: DataStore<Preferences> by preferencesDataStore(na
 data class UserSettings(
     val themeMode: AppThemeMode = AppThemeMode.DARK,
     val maxConcurrentDownloads: Int = 2,
+    val askQualityBeforeDownload: Boolean = true,
+    val autoResumeDownloads: Boolean = true,
     val wifiOnlyDownloads: Boolean = false,
     val warnOnDuplicateDownload: Boolean = true,
     val notificationsEnabled: Boolean = true,
@@ -29,6 +31,8 @@ class UserPreferencesRepository(private val context: Context) {
     private object Keys {
         val THEME_MODE = stringPreferencesKey("theme_mode")
         val MAX_CONCURRENT = intPreferencesKey("max_concurrent_downloads")
+        val ASK_QUALITY_BEFORE_DOWNLOAD = booleanPreferencesKey("ask_quality_before_download")
+        val AUTO_RESUME_DOWNLOADS = booleanPreferencesKey("auto_resume_downloads")
         val WIFI_ONLY = booleanPreferencesKey("wifi_only_downloads")
         val WARN_DUPLICATES = booleanPreferencesKey("warn_duplicate_downloads")
         val NOTIFICATIONS = booleanPreferencesKey("notifications_enabled")
@@ -42,6 +46,8 @@ class UserPreferencesRepository(private val context: Context) {
         UserSettings(
             themeMode = theme,
             maxConcurrentDownloads = (prefs[Keys.MAX_CONCURRENT] ?: 2).coerceIn(1, 4),
+            askQualityBeforeDownload = prefs[Keys.ASK_QUALITY_BEFORE_DOWNLOAD] ?: true,
+            autoResumeDownloads = prefs[Keys.AUTO_RESUME_DOWNLOADS] ?: true,
             wifiOnlyDownloads = prefs[Keys.WIFI_ONLY] ?: false,
             warnOnDuplicateDownload = prefs[Keys.WARN_DUPLICATES] ?: true,
             notificationsEnabled = prefs[Keys.NOTIFICATIONS] ?: true,
@@ -56,6 +62,14 @@ class UserPreferencesRepository(private val context: Context) {
 
     suspend fun setMaxConcurrentDownloads(count: Int) {
         context.dataStore.edit { it[Keys.MAX_CONCURRENT] = count.coerceIn(1, 4) }
+    }
+
+    suspend fun setAskQualityBeforeDownload(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.ASK_QUALITY_BEFORE_DOWNLOAD] = enabled }
+    }
+
+    suspend fun setAutoResumeDownloads(enabled: Boolean) {
+        context.dataStore.edit { it[Keys.AUTO_RESUME_DOWNLOADS] = enabled }
     }
 
     suspend fun setWifiOnlyDownloads(enabled: Boolean) {

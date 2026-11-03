@@ -29,8 +29,8 @@ import androidx.compose.material.icons.automirrored.filled.KeyboardArrowLeft
 import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Download
+import androidx.compose.material.icons.filled.Forward10
 import androidx.compose.material.icons.filled.Fullscreen
-import androidx.compose.material.icons.filled.HighQuality
 import androidx.compose.material.icons.filled.Home
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.LibraryMusic
@@ -41,6 +41,7 @@ import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.PrivacyTip
 import androidx.compose.material.icons.filled.Repeat
+import androidx.compose.material.icons.filled.Replay10
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Shuffle
@@ -182,6 +183,7 @@ fun VideoPlayerModal(
     var currentPosMs by remember { mutableStateOf(0L) }
     var totalDurMs by remember { mutableStateOf(task.durationMs.coerceAtLeast(1000L)) }
     var videoViewRef by remember { mutableStateOf<VideoView?>(null) }
+    var mediaPlayerRef by remember { mutableStateOf<android.media.MediaPlayer?>(null) }
     var playbackSpeed by remember { mutableStateOf("1.0x") }
     var isLocked by remember { mutableStateOf(false) }
 
@@ -191,6 +193,7 @@ fun VideoPlayerModal(
                 videoViewRef?.pause()
                 videoViewRef?.stopPlayback()
             }
+            mediaPlayerRef = null
             videoViewRef = null
         }
     }
@@ -280,8 +283,15 @@ fun VideoPlayerModal(
                                 mediaController.setAnchorView(this)
                                 setVideoURI(Uri.fromFile(videoFile))
                                 setOnPreparedListener { mp ->
+                                    mediaPlayerRef = mp
                                     mp.isLooping = true
                                     if (mp.duration > 0) totalDurMs = mp.duration.toLong()
+                                    val speedFloat = playbackSpeed.removeSuffix("x").toFloatOrNull() ?: 1.0f
+                                    if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M && speedFloat != 1.0f) {
+                                        runCatching {
+                                            mp.playbackParams = mp.playbackParams.setSpeed(speedFloat)
+                                        }
+                                    }
                                     start()
                                 }
                             }
@@ -314,6 +324,7 @@ fun VideoPlayerModal(
                 )
                 Slider(
                     value = progressFraction,
+                    enabled = !isLocked,
                     onValueChange = { fraction ->
                         if (!isLocked) {
                             val targetMs = (fraction * totalDurMs).toLong()
@@ -339,22 +350,23 @@ fun VideoPlayerModal(
 
             Spacer(modifier = Modifier.height(20.dp))
 
-            // Primary Transport Row: |<<   ( ▶ )   >>|
+            // Primary Transport Row: Replay10   ( ▶ )   Forward10
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(36.dp)
             ) {
                 IconButton(
+                    enabled = !isLocked,
                     onClick = {
-                        val targetMs = (currentPosMs - 2000L).coerceAtLeast(0L)
+                        val targetMs = (currentPosMs - 10_000L).coerceAtLeast(0L)
                         currentPosMs = targetMs
                         runCatching { videoViewRef?.seekTo(targetMs.toInt()) }
                     }
                 ) {
                     Icon(
-                        imageVector = Icons.Default.SkipPrevious,
-                        contentDescription = "Previous",
-                        tint = Color.White,
+                        imageVector = Icons.Default.Replay10,
+                        contentDescription = "Replay 10 seconds",
+                        tint = if (isLocked) TextSecondaryDark else Color.White,
                         modifier = Modifier.size(34.dp)
                     )
                 }
@@ -365,7 +377,7 @@ fun VideoPlayerModal(
                         .clip(CircleShape)
                         .background(MidnightCard)
                         .border(1.dp, MidnightBorder, CircleShape)
-                        .clickable {
+                        .clickable(enabled = !isLocked) {
                             isPlaying = !isPlaying
                             videoViewRef?.let { vv ->
                                 if (isPlaying) vv.start() else vv.pause()
@@ -376,22 +388,23 @@ fun VideoPlayerModal(
                     Icon(
                         imageVector = if (isPlaying) Icons.Default.Pause else Icons.Default.PlayArrow,
                         contentDescription = "Play/Pause",
-                        tint = Color.White,
+                        tint = if (isLocked) TextSecondaryDark else Color.White,
                         modifier = Modifier.size(34.dp)
                     )
                 }
 
                 IconButton(
+                    enabled = !isLocked,
                     onClick = {
-                        val targetMs = (currentPosMs + 2000L).coerceAtMost(totalDurMs)
+                        val targetMs = (currentPosMs + 10_000L).coerceAtMost(totalDurMs)
                         currentPosMs = targetMs
                         runCatching { videoViewRef?.seekTo(targetMs.toInt()) }
                     }
                 ) {
                     Icon(
-                        imageVector = Icons.Default.SkipNext,
-                        contentDescription = "Next",
-                        tint = Color.White,
+                        imageVector = Icons.Default.Forward10,
+                        contentDescription = "Forward 10 seconds",
+                        tint = if (isLocked) TextSecondaryDark else Color.White,
                         modifier = Modifier.size(34.dp)
                     )
                 }
@@ -399,7 +412,7 @@ fun VideoPlayerModal(
 
             Spacer(modifier = Modifier.weight(0.7f))
 
-            // Bottom 4-Icon Action Bar: Lock | Quality | Speed | Fullscreen
+            // Bottom Action Bar: Lock | Speed | Open App
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -412,21 +425,28 @@ fun VideoPlayerModal(
                     label = if (isLocked) "Locked" else "Lock",
                     onClick = { isLocked = !isLocked }
                 )
-                PlayerBottomActionItem(
-                    icon = Icons.Default.HighQuality,
-                    label = task.resolutionLabel ?: "Quality",
-                    onClick = { onShare(task) }
-                )
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier
                         .clip(RoundedCornerShape(10.dp))
-                        .clickable {
-                            playbackSpeed = when (playbackSpeed) {
+                        .clickable(enabled = !isLocked) {
+                            val nextSpeed = when (playbackSpeed) {
                                 "1.0x" -> "1.25x"
                                 "1.25x" -> "1.5x"
                                 "1.5x" -> "2.0x"
                                 else -> "1.0x"
+                            }
+                            playbackSpeed = nextSpeed
+                            val speedFloat = nextSpeed.removeSuffix("x").toFloatOrNull() ?: 1.0f
+                            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.M) {
+                                runCatching {
+                                    mediaPlayerRef?.let { mp ->
+                                        mp.playbackParams = mp.playbackParams.setSpeed(speedFloat)
+                                    }
+                                        ?: videoViewRef?.let { vv ->
+                                            if (!isPlaying) vv.start()
+                                        }
+                                }
                             }
                         }
                         .padding(8.dp)
@@ -434,7 +454,7 @@ fun VideoPlayerModal(
                     Text(
                         text = playbackSpeed,
                         style = MaterialTheme.typography.titleSmall,
-                        color = Color.White,
+                        color = if (isLocked) TextSecondaryDark else Color.White,
                         fontWeight = FontWeight.Bold
                     )
                     Spacer(modifier = Modifier.height(4.dp))
@@ -446,7 +466,8 @@ fun VideoPlayerModal(
                 }
                 PlayerBottomActionItem(
                     icon = Icons.Default.Fullscreen,
-                    label = "Fullscreen",
+                    label = "Open App",
+                    enabled = !isLocked,
                     onClick = { onOpenExternally(task) }
                 )
             }
@@ -722,19 +743,20 @@ fun FullScreenMusicPlayer(
 private fun PlayerBottomActionItem(
     icon: ImageVector,
     label: String,
+    enabled: Boolean = true,
     onClick: () -> Unit
 ) {
     Column(
         horizontalAlignment = Alignment.CenterHorizontally,
         modifier = Modifier
             .clip(RoundedCornerShape(10.dp))
-            .clickable(onClick = onClick)
+            .clickable(enabled = enabled, onClick = onClick)
             .padding(8.dp)
     ) {
         Icon(
             imageVector = icon,
             contentDescription = label,
-            tint = Color.White,
+            tint = if (enabled) Color.White else TextSecondaryDark,
             modifier = Modifier.size(22.dp)
         )
         Spacer(modifier = Modifier.height(4.dp))
@@ -1120,34 +1142,25 @@ fun PrivacyPolicyDialog(
 ) {
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("Privacy Policy & Platform Compliance") },
+        title = { Text("Privacy Policy") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    text = "1. Zero Data Collection & Local Processing",
+                    text = "1. Third-Party Link Lookups & Helper Services",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "MediaSave processes all URLs, clipboard text, stream inspections, and audio/video conversions locally on your Android device. No browsing history, clipboard contents, or downloaded files are ever transmitted to any analytics or third-party tracking server.",
+                    text = "When you paste or analyze a link, MediaSave sends the URL and stream lookup requests to the source site and to third-party helper services (including Piped, Invidious, TikWM, TiklyDown, and ddinstagram) to resolve downloadable media streams. Those third-party services receive your submitted link and network request metadata under their own privacy policies.",
                     style = MaterialTheme.typography.bodySmall
                 )
                 Text(
-                    text = "2. Scoped Storage & Permissions",
+                    text = "2. Local Storage & Media Processing",
                     style = MaterialTheme.typography.titleSmall,
                     fontWeight = FontWeight.Bold
                 )
                 Text(
-                    text = "Completed downloads are stored in app-scoped storage and exported to Android MediaStore (Movies/MediaSave, Music/MediaSave, and Download/MediaSave) without requesting invasive broad storage permissions.",
-                    style = MaterialTheme.typography.bodySmall
-                )
-                Text(
-                    text = "3. Platform Terms & Copyright Compliance",
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
-                    text = "MediaSave respects YouTube, Facebook, Instagram, and TikTok Terms of Service and Google Play policies. It does not bypass DRM, authentication walls, or proprietary stream encryption.",
+                    text = "Downloaded video and audio files, stream remuxing, and audio format conversions are stored on your Android device in app-scoped storage and exported to Android MediaStore (Movies/MediaSave, Music/MediaSave, and Download/MediaSave).",
                     style = MaterialTheme.typography.bodySmall
                 )
             }

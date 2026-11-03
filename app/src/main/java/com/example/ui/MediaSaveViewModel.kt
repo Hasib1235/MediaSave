@@ -193,6 +193,7 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
             _authorizedSamples.value = samples
         }
         viewModelScope.launch {
+            var hasTriggeredStartupResume = false
             preferencesRepository.settingsFlow.collect { s ->
                 downloadEngine.updateMaxConcurrentDownloads(s.maxConcurrentDownloads)
                 downloadEngine.updateStorageAndNetworkSettings(
@@ -200,6 +201,10 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
                     notificationsEnabled = s.notificationsEnabled,
                     wifiOnly = s.wifiOnlyDownloads
                 )
+                if (!hasTriggeredStartupResume) {
+                    hasTriggeredStartupResume = true
+                    downloadEngine.resumeInterruptedTasks(s.autoResumeDownloads)
+                }
             }
         }
     }
@@ -380,7 +385,13 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
                 } else if (isFromShareIntent && meta.videoStreams.isNotEmpty()) {
                     _selectedMode.value = DownloaderMode.VIDEO
                 }
-                _showStreamSelectionSheet.value = true
+                if (userSettings.value.askQualityBeforeDownload) {
+                    _showStreamSelectionSheet.value = true
+                } else {
+                    _showStreamSelectionSheet.value = false
+                    _isShareIntentFlow.value = false
+                    startSelectedDownload()
+                }
             }
         }
     }
@@ -835,6 +846,14 @@ class MediaSaveViewModel(application: Application) : AndroidViewModel(applicatio
     fun setMaxConcurrentDownloads(count: Int) {
         downloadEngine.updateMaxConcurrentDownloads(count)
         viewModelScope.launch { preferencesRepository.setMaxConcurrentDownloads(count) }
+    }
+
+    fun setAskQualityBeforeDownload(enabled: Boolean) {
+        viewModelScope.launch { preferencesRepository.setAskQualityBeforeDownload(enabled) }
+    }
+
+    fun setAutoResumeDownloads(enabled: Boolean) {
+        viewModelScope.launch { preferencesRepository.setAutoResumeDownloads(enabled) }
     }
 
     fun setWifiOnlyDownloads(enabled: Boolean) {

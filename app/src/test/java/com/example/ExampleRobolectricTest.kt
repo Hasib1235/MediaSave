@@ -951,6 +951,7 @@ class ExampleRobolectricTest {
             externalScope = CoroutineScope(SupervisorJob() + Dispatchers.IO),
             httpClient = freshResolutionClient
         )
+        freshRecoveryEngine.retryDownload("legacy_403_task")
 
         var recoveredLegacy = dao.getTaskById("legacy_403_task")
         attempts = 0

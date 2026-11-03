@@ -124,55 +124,17 @@ class DownloadEngine(
             } finally {
                 startupRecoveryDeferred.complete(Unit)
             }
-            runCatching {
-                val legacy403Tasks = dao.getFailedHttp403Tasks()
-                for (failedTask in legacy403Tasks) {
-                    retryDownload(failedTask.id)
-                }
-                val completedRemote = dao.getCompletedRemoteTasks()
-                for (task in completedRemote) {
-                    val outFile = File(task.outputFilePath)
-                    if (task.sourceUrl.contains("#fallback_res=") || isLegacySyntheticFallbackFile(outFile)) {
-                        runCatching { if (outFile.exists()) outFile.delete() }
-                        retryDownload(task.id)
-                    }
-                }
-            }
         }
     }
 
-    private fun isLegacySyntheticFallbackFile(file: File): Boolean {
-        if (!file.exists() || file.length() !in 40_000L..360_000L) return false
-        return try {
-            RandomAccessFile(file, "r").use { raf ->
-                val headLen = minOf(file.length(), 2048L).toInt()
-                val buf = ByteArray(headLen)
-                raf.readFully(buf)
-                var i = 0
-                while (i + 20 < headLen) {
-                    if (buf[i] == 'm'.code.toByte() &&
-                        buf[i + 1] == 'd'.code.toByte() &&
-                        buf[i + 2] == 'a'.code.toByte() &&
-                        buf[i + 3] == 't'.code.toByte()
-                    ) {
-                        val d = i + 4
-                        if (d + 14 < headLen &&
-                            buf[d + 4] == 0x65.toByte() &&
-                            buf[d + 5] == 0x88.toByte() &&
-                            buf[d + 6] == 0x84.toByte() &&
-                            buf[d + 7] == 0x21.toByte() &&
-                            buf[d + 8] == ((8 * 29 + 7) and 0xFF).toByte() &&
-                            buf[d + 9] == ((9 * 29 + 7) and 0xFF).toByte()
-                        ) {
-                            return true
-                        }
-                    }
-                    i++
-                }
-                false
+    fun resumeInterruptedTasks(autoResumeEnabled: Boolean) {
+        if (!autoResumeEnabled) return
+        externalScope.launch(Dispatchers.IO) {
+            startupRecoveryDeferred.await()
+            val interrupted = runCatching { dao.getInterruptedTasks() }.getOrDefault(emptyList())
+            for (task in interrupted) {
+                resumeDownload(task.id)
             }
-        } catch (_: Exception) {
-            false
         }
     }
 

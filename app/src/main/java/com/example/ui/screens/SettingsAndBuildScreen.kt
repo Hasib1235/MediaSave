@@ -61,6 +61,8 @@ import androidx.compose.material.icons.outlined.DeleteSweep
 import androidx.compose.material.icons.outlined.Info
 import androidx.compose.material.icons.outlined.PrivacyTip
 import androidx.compose.material.icons.outlined.Storage
+import androidx.compose.material.icons.outlined.WarningAmber
+import androidx.compose.material.icons.outlined.Wifi
 
 /**
  * Screen 9: "Settings" matching the exact layout of the reference image, with functional
@@ -71,6 +73,8 @@ fun SettingsAndBuildScreen(
     settings: UserSettings,
     onThemeModeChange: (AppThemeMode) -> Unit,
     onMaxConcurrentChange: (Int) -> Unit,
+    onAskQualityChange: (Boolean) -> Unit = {},
+    onAutoResumeChange: (Boolean) -> Unit = {},
     onWifiOnlyChange: (Boolean) -> Unit,
     onWarnDuplicateChange: (Boolean) -> Unit,
     onNotificationsChange: (Boolean) -> Unit,
@@ -83,8 +87,6 @@ fun SettingsAndBuildScreen(
     onShowMessage: (String) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
-    var askQualityBeforeDownload by remember { mutableStateOf(true) }
-    var autoResumeDownload by remember { mutableStateOf(true) }
     var selectedLanguage by remember { mutableStateOf("English") }
 
     val notificationPermissionLauncher = rememberLauncherForActivityResult(
@@ -127,7 +129,7 @@ fun SettingsAndBuildScreen(
                     Text(
                         text = "Settings",
                         style = MaterialTheme.typography.titleLarge,
-                        color = Color.White,
+                        color = MaterialTheme.colorScheme.onBackground,
                         fontWeight = FontWeight.Bold
                     )
                 }
@@ -138,7 +140,7 @@ fun SettingsAndBuildScreen(
                 Text(
                     text = "Download Settings",
                     style = MaterialTheme.typography.titleSmall,
-                    color = Color.White,
+                    color = MaterialTheme.colorScheme.onBackground,
                     fontWeight = FontWeight.Bold
                 )
                 Spacer(modifier = Modifier.height(10.dp))
@@ -187,11 +189,8 @@ fun SettingsAndBuildScreen(
                         SettingsSwitchRow(
                             icon = Icons.Outlined.HighQuality,
                             title = "Ask Quality Before Download",
-                            checked = askQualityBeforeDownload,
-                            onCheckedChange = {
-                                askQualityBeforeDownload = it
-                                onWarnDuplicateChange(it)
-                            },
+                            checked = settings.askQualityBeforeDownload,
+                            onCheckedChange = onAskQualityChange,
                             testTag = "toggle_ask_quality"
                         )
                         SettingsDivider()
@@ -218,12 +217,27 @@ fun SettingsAndBuildScreen(
                         SettingsSwitchRow(
                             icon = Icons.Outlined.Autorenew,
                             title = "Auto Resume Download",
-                            checked = autoResumeDownload,
-                            onCheckedChange = {
-                                autoResumeDownload = it
-                                onWifiOnlyChange(!it)
-                            },
+                            checked = settings.autoResumeDownloads,
+                            onCheckedChange = onAutoResumeChange,
                             testTag = "toggle_auto_resume"
+                        )
+                        SettingsDivider()
+
+                        SettingsSwitchRow(
+                            icon = Icons.Outlined.WarningAmber,
+                            title = "Warn Before Duplicate Downloads",
+                            checked = settings.warnOnDuplicateDownload,
+                            onCheckedChange = onWarnDuplicateChange,
+                            testTag = "toggle_warn_duplicate"
+                        )
+                        SettingsDivider()
+
+                        SettingsSwitchRow(
+                            icon = Icons.Outlined.Wifi,
+                            title = "Wi-Fi Only Downloads",
+                            checked = settings.wifiOnlyDownloads,
+                            onCheckedChange = onWifiOnlyChange,
+                            testTag = "toggle_wifi_only"
                         )
                     }
                 }
@@ -235,7 +249,7 @@ fun SettingsAndBuildScreen(
                 Text(
                     text = "App Settings",
                     style = MaterialTheme.typography.titleSmall,
-                    color = Color.White,
+                    color = MaterialTheme.colorScheme.onBackground,
                     fontWeight = FontWeight.Bold
                 )
                 Spacer(modifier = Modifier.height(10.dp))
@@ -288,7 +302,7 @@ fun SettingsAndBuildScreen(
                 Text(
                     text = "Storage & Information",
                     style = MaterialTheme.typography.titleSmall,
-                    color = Color.White,
+                    color = MaterialTheme.colorScheme.onBackground,
                     fontWeight = FontWeight.Bold
                 )
                 Spacer(modifier = Modifier.height(10.dp))
@@ -326,7 +340,7 @@ fun SettingsAndBuildScreen(
                         SettingsChevronRow(
                             icon = Icons.Outlined.PrivacyTip,
                             title = "Privacy Policy",
-                            subtitle = "Zero-tracking local media processing & platform compliance",
+                            subtitle = "Third-party link lookup services & local media storage",
                             onClick = onOpenPrivacyPolicy
                         )
                         SettingsDivider()

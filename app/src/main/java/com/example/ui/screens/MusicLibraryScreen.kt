@@ -57,9 +57,7 @@ import com.example.ui.theme.TextSecondaryDark
 
 private enum class MusicSubFilter(val label: String) {
     ALL("All"),
-    SONGS("Songs"),
-    ALBUMS("Albums"),
-    ARTISTS("Artists")
+    SONGS("Songs")
 }
 
 /**
@@ -104,7 +102,7 @@ fun MusicLibraryScreen(
                     Icon(
                         imageVector = Icons.AutoMirrored.Filled.KeyboardArrowLeft,
                         contentDescription = "Back",
-                        tint = Color.White,
+                        tint = MaterialTheme.colorScheme.onBackground,
                         modifier = Modifier.size(28.dp)
                     )
                 }
@@ -112,7 +110,7 @@ fun MusicLibraryScreen(
                 Text(
                     text = "Music Library",
                     style = MaterialTheme.typography.titleLarge,
-                    color = Color.White,
+                    color = MaterialTheme.colorScheme.onBackground,
                     fontWeight = FontWeight.Bold,
                     modifier = Modifier.align(Alignment.Center)
                 )
@@ -120,7 +118,7 @@ fun MusicLibraryScreen(
 
             Spacer(modifier = Modifier.height(14.dp))
 
-            // Sub-filter pill tabs: All | Songs | Albums | Artists
+            // Sub-filter pill tabs: All | Songs
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp)

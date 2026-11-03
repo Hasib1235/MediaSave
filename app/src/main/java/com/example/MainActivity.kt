@@ -412,6 +412,8 @@ fun MediaSaveAppRoot(viewModel: MediaSaveViewModel) {
                                 settings = settings,
                                 onThemeModeChange = viewModel::setThemeMode,
                                 onMaxConcurrentChange = viewModel::setMaxConcurrentDownloads,
+                                onAskQualityChange = viewModel::setAskQualityBeforeDownload,
+                                onAutoResumeChange = viewModel::setAutoResumeDownloads,
                                 onWifiOnlyChange = viewModel::setWifiOnlyDownloads,
                                 onWarnDuplicateChange = viewModel::setWarnOnDuplicateDownload,
                                 onNotificationsChange = viewModel::setNotificationsEnabled,

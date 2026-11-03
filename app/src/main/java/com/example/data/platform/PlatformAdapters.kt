@@ -232,7 +232,20 @@ class DirectUrlMediaAdapter(
                         ?: contentLength
                     supportsRanges = statusCode == 206 || response.header("Accept-Ranges")?.contains("bytes", ignoreCase = true) == true
 
-                    val rawBytes = response.body?.bytes()
+                    val maxProbeBytes = 2 * 1024 * 1024
+                    val rawBytes = response.body?.byteStream()?.use { stream ->
+                        val out = java.io.ByteArrayOutputStream()
+                        val buf = ByteArray(16 * 1024)
+                        var totalRead = 0
+                        while (totalRead < maxProbeBytes) {
+                            val toRead = minOf(buf.size, maxProbeBytes - totalRead)
+                            val read = stream.read(buf, 0, toRead)
+                            if (read <= 0) break
+                            out.write(buf, 0, read)
+                            totalRead += read
+                        }
+                        out.toByteArray()
+                    }
                     initialProbeBytes = rawBytes
 
                     if (contentType?.contains("json") == true || path.endsWith(".mediasave.json", ignoreCase = true)) {
